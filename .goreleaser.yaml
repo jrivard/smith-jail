@@ -1,0 +1,49 @@
+version: 2
+
+project_name: smith-jail
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: smith-jail
+    main: .
+    binary: smith-jail
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.Version={{.Version}}
+    # macOS is best-effort: smith-jail's filesystem jail works there, but the
+    # optional --network-jail feature is Linux-only (nftables + CAP_NET_ADMIN)
+    # and refuses to run on darwin. See README's "Platform support" section.
+
+archives:
+  - id: smith-jail
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+release:
+  github:
+    owner: jrivard
+    name: smith-jail
