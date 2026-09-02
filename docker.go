@@ -79,11 +79,23 @@ func InstalledVersion(agent *Agent, cfg *Config) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	id, idErr := newSessionID()
+	if idErr != nil {
+		return ""
+	}
+	containerName := "smithjail-version-check-" + id
+
 	out, err := exec.CommandContext(ctx,
 		"docker", "run", "--rm",
+		"--name", containerName,
 		"--entrypoint", agent.BinaryName,
 		agent.ImageRef(cfg), "--version",
 	).Output()
+	// If ctx's deadline killed the docker CLI above, that only severs the
+	// client connection — it doesn't stop the container, so --rm never fires
+	// and it would otherwise run forever. Force-removing by name here
+	// guarantees no orphan survives this call, however it ended.
+	_ = exec.Command("docker", "rm", "-f", containerName).Run()
 	if err != nil {
 		return ""
 	}

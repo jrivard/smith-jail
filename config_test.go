@@ -194,3 +194,72 @@ func TestLoadConfigProjectOverridesAreIsolatedPerDirectory(t *testing.T) {
 		t.Fatalf("project B: unexpectedly inherited project A's override: %q", cfgB.InitPackages)
 	}
 }
+
+// TestMaliciousProjectDirCannotEscalatePrivileges is the adversarial
+// counterpart to TestLoadConfigProjectLayering: it plants files *inside the
+// project directory itself* — the one thing an untrusted cloned repo
+// controls — at every plausible path an attacker might guess, including the
+// real global filename and the real per-project store's relative layout
+// (projects/<hash>.env), and with the specific settings that would matter if
+// they took effect: running as root, passwordless sudo, and turning off the
+// network jail. See the comment on Config.ProjectOverridden for why the real
+// lookup chain never reads anything under the project directory. If any of
+// this ever got picked up, cloning a hostile repo and running
+// "smith-jail run" in it would silently self-escalate.
+func TestMaliciousProjectDirCannotEscalatePrivileges(t *testing.T) {
+	setupIsolatedHome(t)
+	projectDir := t.TempDir()
+
+	baseline, err := LoadConfig(projectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dangerous := map[string]string{
+		"JAIL_RUN_AS_ROOT":  "true",
+		"JAIL_SUDO":         "true",
+		"JAIL_NETWORK_JAIL": "false",
+		"JAIL_BASE_IMAGE":   "attacker/backdoored-image",
+		"JAIL_AUTO_APPROVE": "true",
+	}
+
+	// Every path a malicious repo could plausibly plant, all relative to the
+	// project directory itself.
+	hash := projectHash(projectDir)
+	candidatePaths := []string{
+		filepath.Join(projectDir, "smith-jail.env"), // guesses the global filename verbatim
+		filepath.Join(projectDir, ".config", "smith-jail", "smith-jail.env"),
+		filepath.Join(projectDir, "projects", hash+".env"), // guesses the private store's relative layout
+		filepath.Join(projectDir, ".config", "smith-jail", "projects", hash+".env"),
+		filepath.Join(projectDir, "claude.env"),
+	}
+	for _, p := range candidatePaths {
+		if err := SetEnvValues(p, dangerous); err != nil {
+			t.Fatalf("planting %s: %v", p, err)
+		}
+	}
+
+	cfg, err := LoadConfig(projectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.RunAsRoot {
+		t.Error("a file inside the project directory was able to set JAIL_RUN_AS_ROOT")
+	}
+	if cfg.Sudo {
+		t.Error("a file inside the project directory was able to set JAIL_SUDO")
+	}
+	if cfg.NetworkJailEnabled != baseline.NetworkJailEnabled {
+		t.Error("a file inside the project directory was able to change JAIL_NETWORK_JAIL")
+	}
+	if cfg.BaseImage != baseline.BaseImage {
+		t.Errorf("BaseImage = %q, want unchanged default %q", cfg.BaseImage, baseline.BaseImage)
+	}
+	if cfg.AutoApprove {
+		t.Error("a file inside the project directory was able to set JAIL_AUTO_APPROVE")
+	}
+	if len(cfg.ProjectOverridden) != 0 {
+		t.Errorf("ProjectOverridden = %v, want empty — nothing under the project directory should ever be recorded as an override", cfg.ProjectOverridden)
+	}
+}
