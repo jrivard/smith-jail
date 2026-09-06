@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -57,9 +58,9 @@ func RunDoctorChecks(cfg *Config) []DoctorCheck {
 	dockerUp := checkDockerDaemon()
 	checks = append(checks, dockerUp)
 
-	checks = append(checks, checkNftBinary())
-	checks = append(checks, checkNetAdminCapability())
+	checks = append(checks, checkNetworkJailPlatform())
 	checks = append(checks, checkSELinuxStatus())
+	checks = append(checks, checkNftRedirModule())
 
 	if cfg != nil {
 		checks = append(checks, checkDirWritable("Config directory", cfg.UserConfigDir))
@@ -152,47 +153,20 @@ func checkDockerDaemon() DoctorCheck {
 	return DoctorCheck{Name: "Docker daemon", Status: statusOK, Detail: detail}
 }
 
-// checkNftBinary and checkNetAdminCapability are only needed for
-// --network-jail, so their absence is a warning rather than a failure —
-// everything else in smith-jail works fine without them. On non-Linux hosts
-// --network-jail is unavailable outright (nftables is a Linux kernel
-// feature), so these are informational rather than something to fix.
-func checkNftBinary() DoctorCheck {
+// checkNetworkJailPlatform reports whether --network-jail is usable here.
+// Unlike smith-jail's earlier host-nft design, there's no host-side
+// toolchain or capability to check for: the jail's proxy sidecar and
+// netsetup helper are ordinary Docker containers (built from images
+// smith-jail embeds and builds itself — see EnsureProxyImages), and
+// NET_ADMIN is granted only to the ephemeral netsetup container, which any
+// user who can run `docker run --cap-add` at all can already do. The
+// feature is still Linux-only: it depends on Linux network namespaces and
+// nftables running *inside* the containers involved.
+func checkNetworkJailPlatform() DoctorCheck {
 	if runtime.GOOS != "linux" {
-		return DoctorCheck{Name: "nftables (--network-jail)", Status: statusOK, Detail: "not applicable on " + runtime.GOOS + " — --network-jail is Linux-only"}
+		return DoctorCheck{Name: "Network jail (--network-jail)", Status: statusOK, Detail: "not applicable on " + runtime.GOOS + " — --network-jail is Linux-only"}
 	}
-	path, err := findNft()
-	if err != nil {
-		return DoctorCheck{
-			Name:   "nftables (--network-jail)",
-			Status: statusWarn,
-			Detail: "nft not found in PATH or common sbin locations",
-			Fix:    "sudo zypper install nftables",
-		}
-	}
-	return DoctorCheck{Name: "nftables (--network-jail)", Status: statusOK, Detail: path}
-}
-
-func checkNetAdminCapability() DoctorCheck {
-	if runtime.GOOS != "linux" {
-		return DoctorCheck{Name: "NET_ADMIN capability (--network-jail)", Status: statusOK, Detail: "not applicable on " + runtime.GOOS}
-	}
-	if _, err := findNft(); err != nil {
-		return DoctorCheck{
-			Name:   "NET_ADMIN capability (--network-jail)",
-			Status: statusWarn,
-			Detail: "cannot check without nft installed",
-		}
-	}
-	if err := checkNetAdmin(); err != nil {
-		return DoctorCheck{
-			Name:   "NET_ADMIN capability (--network-jail)",
-			Status: statusWarn,
-			Detail: "missing — nft cannot manage firewall rules as this user",
-			Fix:    "sudo setcap cap_net_admin+ep $(which smith-jail)",
-		}
-	}
-	return DoctorCheck{Name: "NET_ADMIN capability (--network-jail)", Status: statusOK, Detail: "granted"}
+	return DoctorCheck{Name: "Network jail (--network-jail)", Status: statusOK, Detail: "no host setup required — proxy and rule-setup run in ephemeral containers"}
 }
 
 // checkSELinuxStatus is informational only: enforcing, permissive, and
@@ -214,6 +188,83 @@ func checkSELinuxStatus() DoctorCheck {
 		Status: statusOK,
 		Detail: mode + " — bind mounts will be labelled automatically",
 	}
+}
+
+// checkNftRedirModule reports whether the kernel's "nft_redir" module — the
+// nftables NAT expression nftRules' "redirect to" statements depend on — is
+// loaded or built into the running kernel.
+//
+// This matters because of *when* it can load: the kernel only auto-loads
+// nft expression modules for requests made from the init network namespace.
+// --network-jail's rules are applied inside the proxy sidecar's own,
+// non-init network namespace (see runNetsetup), so on a host that has never
+// loaded nft_redir before, the kernel refuses to auto-load it there and the
+// very first --network-jail run fails with a cryptic nft parse error
+// ("Could not process rule: No such file or directory") rather than
+// anything mentioning the module. Loading it once via the host's own
+// namespace (a plain `modprobe`, run outside any container) fixes every
+// jail run for the rest of that boot.
+// nftRedirCheckName identifies checkNftRedirModule's result so doctorGate
+// (main.go) can recognize and skip it for runs that aren't using
+// --network-jail, where it's a diagnostic irrelevant to what's about to run
+// rather than a live problem worth interrupting the user over.
+const nftRedirCheckName = "nftables redirect module (nft_redir)"
+
+func checkNftRedirModule() DoctorCheck {
+	if runtime.GOOS != "linux" {
+		return DoctorCheck{Name: nftRedirCheckName, Status: statusOK, Detail: "not applicable on " + runtime.GOOS}
+	}
+
+	if loaded, err := kernelModuleLoaded("nft_redir"); err == nil && loaded {
+		return DoctorCheck{Name: nftRedirCheckName, Status: statusOK, Detail: "loaded"}
+	}
+	if builtin, err := kernelModuleBuiltin("nft_redir"); err == nil && builtin {
+		return DoctorCheck{Name: nftRedirCheckName, Status: statusOK, Detail: "built into the running kernel"}
+	}
+
+	return DoctorCheck{
+		Name:   nftRedirCheckName,
+		Status: statusWarn,
+		Detail: "not currently loaded — the first --network-jail run this boot will fail with an nft parse error until it is",
+		Fix:    "sudo modprobe nft_redir",
+	}
+}
+
+// kernelModuleLoaded reports whether a module is currently loaded, per
+// /proc/modules.
+func kernelModuleLoaded(name string) (bool, error) {
+	data, err := os.ReadFile("/proc/modules")
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if fields := strings.Fields(line); len(fields) > 0 && fields[0] == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// kernelModuleBuiltin reports whether a module is compiled directly into
+// the running kernel (never loadable/unloadable, so it never appears in
+// /proc/modules but is always available), per modules.builtin.
+func kernelModuleBuiltin(name string) (bool, error) {
+	out, err := exec.Command("uname", "-r").Output()
+	if err != nil {
+		return false, err
+	}
+	release := strings.TrimSpace(string(out))
+
+	for _, base := range []string{"/lib/modules", "/usr/lib/modules"} {
+		data, err := os.ReadFile(filepath.Join(base, release, "modules.builtin"))
+		if err != nil {
+			continue
+		}
+		if strings.Contains(string(data), "/"+name+".ko") {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // checkDirWritable ensures a directory smith-jail needs to write into
@@ -287,6 +338,39 @@ func checkCredentialDir(name, path string, cfg *Config) DoctorCheck {
 		}
 	}
 	return DoctorCheck{Name: name, Status: statusOK, Detail: path}
+}
+
+// doctorGate runs the same checks as `smith-jail doctor`, silently, right
+// before a run starts — most runs never print anything from this. Anything
+// short of statusOK gets surfaced, and the user is asked whether to proceed
+// anyway, defaulting to no like every other "Confirm:" prompt in this
+// codebase (and, like them, skipped outright under --yes/JAIL_AUTO_APPROVE).
+//
+// The nft_redir check is dropped unless this run actually has
+// --network-jail enabled — it's a real problem for a jailed run and a
+// useless interruption for anything else.
+func doctorGate(cfg *Config) bool {
+	var issues []DoctorCheck
+	for _, c := range RunDoctorChecks(cfg) {
+		if c.Status == statusOK {
+			continue
+		}
+		if c.Name == nftRedirCheckName && !cfg.NetworkJailEnabled {
+			continue
+		}
+		issues = append(issues, c)
+	}
+	if len(issues) == 0 {
+		return true
+	}
+
+	fmt.Println()
+	printWarn("smith-jail doctor found issues with this environment:")
+	fmt.Println()
+	for _, c := range issues {
+		printDoctorCheck(c)
+	}
+	return confirm("proceed anyway", cfg.AutoApprove)
 }
 
 // ── CLI ─────────────────────────────────────────────────────────────────────

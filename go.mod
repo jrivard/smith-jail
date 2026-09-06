@@ -7,7 +7,10 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.4
 	github.com/charmbracelet/lipgloss v1.0.0
 	github.com/docker/docker v27.3.1+incompatible
+	github.com/docker/go-connections v0.5.0
 	github.com/mattn/go-isatty v0.0.20
+	github.com/miekg/dns v1.1.62
+	golang.org/x/sys v0.30.0
 )
 
 require (
@@ -18,7 +21,6 @@ require (
 	github.com/charmbracelet/x/term v0.2.1 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/distribution/reference v0.6.0 // indirect
-	github.com/docker/go-connections v0.5.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
@@ -44,9 +46,11 @@ require (
 	go.opentelemetry.io/otel/metric v1.30.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.30.0 // indirect
 	go.opentelemetry.io/otel/trace v1.30.0 // indirect
+	golang.org/x/mod v0.18.0 // indirect
+	golang.org/x/net v0.29.0 // indirect
 	golang.org/x/sync v0.11.0 // indirect
-	golang.org/x/sys v0.30.0 // indirect
 	golang.org/x/text v0.18.0 // indirect
 	golang.org/x/time v0.9.0 // indirect
+	golang.org/x/tools v0.22.0 // indirect
 	gotest.tools/v3 v3.5.2 // indirect
 )

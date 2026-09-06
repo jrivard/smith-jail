@@ -14,8 +14,8 @@
 
 package main
 
-// hubRow identifies one row of the always-focused list on the dashboard —
-// the single entry point into everything the TUI can do.
+// hubRow identifies one row of an always-focused list on the TUI — either
+// the "New session" submenu or the dashboard's global rows.
 type hubRow int
 
 const (
@@ -25,8 +25,8 @@ const (
 	rowChangeProject
 	rowSettings
 	rowOllamaModel
-	rowArtifacts
 	rowDockerfile
+	rowArtifacts
 	rowCheckUpdates
 	rowDoctor
 	rowHelp
@@ -38,15 +38,23 @@ type hubItem struct {
 	label string
 }
 
-var hubItems = []hubItem{
+// newSessionItems is the "New session" submenu: everything that configures
+// or launches a session for the currently selected agent+directory.
+var newSessionItems = []hubItem{
 	{rowRun, "Run"},
 	{rowShell, "Shell"},
 	{rowChangeAgent, "Change agent"},
 	{rowChangeProject, "Change project"},
 	{rowSettings, "Settings"},
 	{rowOllamaModel, "Ollama model"},
-	{rowArtifacts, "Docker artifacts"},
 	{rowDockerfile, "Dockerfile"},
+}
+
+// dashGlobalItems are the dashboard's agent/directory-independent rows,
+// reachable from the top level alongside the active sessions list and
+// "New session ▸".
+var dashGlobalItems = []hubItem{
+	{rowArtifacts, "Docker artifacts"},
 	{rowCheckUpdates, "Check updates"},
 	{rowDoctor, "Doctor"},
 	{rowHelp, "Help"},

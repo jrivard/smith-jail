@@ -19,82 +19,54 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
+
+	"github.com/jrivard/smith-jail/internal/proxyproto"
 )
 
-const (
-	// Linux caps interface names at 15 characters (IFNAMSIZ - 1), so the bridge
-	// name has a tight budget: a 3-character prefix plus an 8-hex session ID
-	// comes to 11, leaving headroom.
-	bridgeIfacePrefix = "sj-"
-	sessionIDLen      = 8
+const sessionIDLen = 8
 
-	// legacyBridgeIface is the fixed bridge name used before session IDs
-	// existed. Recognised only so stale tables from those builds can be
-	// identified; nothing creates it any more.
-	legacyBridgeIface = "cj-restricted"
-
-	nftTablePrefix = "smithjail-"
-)
-
-// nftSbinFallbacks are searched when "nft" isn't on $PATH. Package managers
-// (including openSUSE's zypper) install nft under sbin, which isn't on a
-// regular, non-root user's $PATH on most distros — so exec.LookPath alone
-// reports "not found" even when nftables is installed and usable via sudo.
-var nftSbinFallbacks = []string{"/usr/sbin/nft", "/sbin/nft", "/usr/local/sbin/nft"}
-
-// findNft resolves the nft binary, checking $PATH first and then the usual
-// sbin locations. Every nft invocation in this file goes through it instead
-// of a bare "nft", which would silently re-fail the same PATH lookup.
-func findNft() (string, error) {
-	if path, err := exec.LookPath("nft"); err == nil {
-		return path, nil
-	}
-	for _, candidate := range nftSbinFallbacks {
-		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-			return candidate, nil
-		}
-	}
-	return "", fmt.Errorf("nft not found in PATH or %s", strings.Join(nftSbinFallbacks, ", "))
-}
-
-// NetworkJail manages the per-session Docker network and nft firewall rules.
+// NetworkJail is the per-session network sandbox: a plain, WAN-reachable
+// Docker network that only two containers ever join — a proxy sidecar that
+// owns the network namespace, and (via `--network container:<proxy>`) the
+// agent container itself. A one-shot helper installs nft rules *inside that
+// namespace* (never the host's) that redirect the namespace's outbound
+// :80/:443/:53 traffic into the proxy, which decides — by consulting a live
+// allow-list — whether to relay each connection or refuse it.
+//
+// This replaces smith-jail's earlier design, which wrote nft rules into the
+// *host's* namespace and required a standing CAP_NET_ADMIN grant on the
+// smith-jail binary itself. Nothing here holds that capability except the
+// netsetup helper, briefly, for the one call that installs the rules — see
+// runNetsetup.
 type NetworkJail struct {
-	sessionID    string
-	networkID    string
-	networkName  string
-	bridgeIface  string
-	nftTableName string
-	resolvedIPs  []string
+	sessionID          string
+	networkID          string
+	networkName        string
+	proxyContainerID   string
+	proxyContainerName string
+	policyFilePath     string // temp host file, bind-mounted into the proxy; removed on Cleanup
+	allowedHosts       []string
 }
 
-// newSessionID returns a random token that makes every jail's kernel-level
-// names unique. Without it the bridge and nft table names collide between
-// concurrent sessions: two jails cannot share one bridge interface, and a
-// shared nft table means the first session to exit tears down the firewall
-// protecting the other.
+// newSessionID returns a random token that makes every jail's container and
+// network names unique, so concurrent sessions never collide.
 func newSessionID() (string, error) {
 	buf := make([]byte, sessionIDLen/2)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("generating session id: %w", err)
 	}
 	return hex.EncodeToString(buf), nil
-}
-
-func bridgeIfaceName(sessionID string) string { return bridgeIfacePrefix + sessionID }
-
-func nftTableName(agent *Agent, sessionID string) string {
-	return nftTablePrefix + agent.Name + "-" + sessionID
 }
 
 // InvokeOptions holds per-invocation flags that affect network jail behaviour.
@@ -105,20 +77,14 @@ type InvokeOptions struct {
 	AutoApprove     bool     // from --yes/-y flag
 }
 
-// NewNetworkJail creates a Docker network and nft rules for the session.
+// NewNetworkJail creates the session's proxy sidecar, network, and nft
+// rules, and blocks until the proxy is confirmed listening.
 func NewNetworkJail(agent *Agent, cfg *Config, opts *InvokeOptions, dir string) (*NetworkJail, error) {
 	if runtime.GOOS != "linux" {
-		return nil, fmt.Errorf("--network-jail requires Linux (nftables + CAP_NET_ADMIN) — not supported on %s", runtime.GOOS)
+		return nil, fmt.Errorf("--network-jail requires Linux (nftables + CAP_NET_ADMIN in an ephemeral helper) — not supported on %s", runtime.GOOS)
 	}
-
-	if _, err := findNft(); err != nil {
-		return nil, fmt.Errorf("nft not found — install nftables: sudo zypper install nftables")
-	}
-
-	if err := checkNetAdmin(); err != nil {
-		return nil, fmt.Errorf("NET_ADMIN capability required for network jail\n"+
-			"  Grant it once with: sudo setcap cap_net_admin+ep $(which smith-jail)\n"+
-			"  Or run: sudo smith-jail %s run --network-jail ...", agent.Name)
+	if err := requireNftRedirModule(); err != nil {
+		return nil, err
 	}
 
 	sessionID, err := newSessionID()
@@ -126,19 +92,76 @@ func NewNetworkJail(agent *Agent, cfg *Config, opts *InvokeOptions, dir string) 
 		return nil, err
 	}
 
-	// Rules left by a session that died before its cleanup ran would otherwise
-	// accumulate in the kernel ruleset forever.
-	pruneStaleNftTables()
+	hosts, err := effectiveAllowedHosts(agent, cfg, opts)
+	if err != nil {
+		return nil, err
+	}
 
 	hash := projectHash(dir)
 	j := &NetworkJail{
-		sessionID:    sessionID,
-		networkName:  agent.ContainerPrefix() + "-net-" + hash,
-		bridgeIface:  bridgeIfaceName(sessionID),
-		nftTableName: nftTableName(agent, sessionID),
+		sessionID:          sessionID,
+		networkName:        agent.ContainerPrefix() + "-net-" + hash,
+		proxyContainerName: agent.ContainerPrefix() + "-proxy-" + sessionID,
+		allowedHosts:       hosts,
 	}
 
-	// Build the full allowed host list: agent defaults + config + flags
+	proxyTag, netsetupTag, err := EnsureProxyImages()
+	if err != nil {
+		return nil, fmt.Errorf("preparing network jail images: %w", err)
+	}
+
+	networkID, err := createDockerNetwork(j.networkName, dir, agent.Name)
+	if err != nil {
+		return nil, fmt.Errorf("creating Docker network: %w", err)
+	}
+	j.networkID = networkID
+
+	policyPath, err := writePolicyFile(hosts)
+	if err != nil {
+		_ = j.Cleanup()
+		return nil, fmt.Errorf("writing network policy: %w", err)
+	}
+	j.policyFilePath = policyPath
+
+	eventLogPath, err := netLogPath(agent, dir)
+	if err != nil {
+		_ = j.Cleanup()
+		return nil, fmt.Errorf("preparing network event log: %w", err)
+	}
+	if err := ensureFileExists(eventLogPath); err != nil {
+		_ = j.Cleanup()
+		return nil, fmt.Errorf("creating network event log %s: %w", eventLogPath, err)
+	}
+
+	printInfo(fmt.Sprintf("Starting network proxy (allowed hosts: %d)...", len(hosts)))
+	proxyID, err := startProxyContainer(j.networkName, j.proxyContainerName, policyPath, eventLogPath, proxyTag, agent, dir)
+	if err != nil {
+		_ = j.Cleanup()
+		return nil, fmt.Errorf("starting proxy sidecar: %w", err)
+	}
+	j.proxyContainerID = proxyID
+
+	if err := waitProxyReady(j.proxyContainerName, 15*time.Second); err != nil {
+		_ = j.Cleanup()
+		return nil, fmt.Errorf("proxy sidecar: %w", err)
+	}
+
+	if err := runNetsetup(j.proxyContainerName, netsetupTag, nftRules()); err != nil {
+		_ = j.Cleanup()
+		return nil, fmt.Errorf("installing network jail rules: %w", err)
+	}
+
+	printOK(fmt.Sprintf("Network jail active — proxy: %s, allowed hosts: %d", j.proxyContainerName, len(hosts)))
+	return j, nil
+}
+
+// effectiveAllowedHosts assembles the session's hostname allow-list: agent
+// defaults + project config + this invocation's flags. hermes-local also
+// implicitly allows its Ollama sidecar's container name, so the sidecar
+// stays reachable by name even with the jail active — see
+// proxyproto.UpstreamDNSDefault for why the proxy's DNS forwarder can
+// resolve it at all.
+func effectiveAllowedHosts(agent *Agent, cfg *Config, opts *InvokeOptions) ([]string, error) {
 	hosts := append([]string{}, agent.DefaultAllowed...)
 	hosts = append(hosts, cfg.NetworkAllowHosts...)
 	hosts = append(hosts, opts.ExtraAllowHosts...)
@@ -151,51 +174,43 @@ func NewNetworkJail(agent *Agent, cfg *Config, opts *InvokeOptions, dir string) 
 		hosts = append(hosts, extra...)
 	}
 
-	printInfo(fmt.Sprintf("Resolving %d allowed hosts...", len(hosts)))
-	ips, err := resolveHosts(hosts)
-	if err != nil {
-		return nil, fmt.Errorf("resolving allowed hosts: %w", err)
-	}
-	if len(ips) == 0 {
-		return nil, fmt.Errorf("no IPs resolved for allowed hosts — check DNS")
-	}
-	j.resolvedIPs = ips
-	printInfo(fmt.Sprintf("Resolved %d IPs across %d hosts", len(ips), len(hosts)))
-
-	if !confirm(fmt.Sprintf("create Docker network %q", j.networkName), cfg.AutoApprove) {
-		return nil, errAborted
+	if agent.Name == "hermes-local" {
+		hosts = append(hosts, OllamaContainerName)
 	}
 
-	networkID, bridgeIface, err := createDockerNetwork(j.networkName, j.bridgeIface, dir, agent.Name)
-	if err != nil {
-		return nil, fmt.Errorf("creating Docker network: %w", err)
-	}
-	j.networkID = networkID
-	// Trust what Docker actually created over what was requested.
-	j.bridgeIface = bridgeIface
-
-	if err := j.writeNftRules(); err != nil {
-		_ = j.Cleanup()
-		return nil, fmt.Errorf("writing nft rules: %w", err)
-	}
-
-	printOK(fmt.Sprintf("Network jail active — bridge: %s, allowed IPs: %d", bridgeIface, len(ips)))
-	return j, nil
+	return hosts, nil
 }
 
-// DockerNetworkName returns the Docker network name to pass to --network.
-func (j *NetworkJail) DockerNetworkName() string {
+// NetworkArg returns the docker --network value the agent container (and
+// nothing else) should be created with: joining the proxy's namespace
+// entirely, rather than getting its own network attachment.
+func (j *NetworkJail) NetworkArg() string {
+	return "container:" + j.proxyContainerName
+}
+
+// NetworkName returns the actual underlying Docker network — needed by
+// callers (the hermes-local Ollama sidecar) that must genuinely join a
+// network rather than share a container's namespace via NetworkArg.
+func (j *NetworkJail) NetworkName() string {
 	return j.networkName
 }
 
-// Cleanup removes the nft table and Docker network.
+// Cleanup removes the proxy sidecar, its policy file, and the session
+// network. The agent container removes itself (it's started with --rm); the
+// netsetup helper already removed itself after installing the rules.
 func (j *NetworkJail) Cleanup() error {
 	var errs []string
 
-	if err := nftRun("delete", "table", "inet", j.nftTableName); err != nil {
-		errs = append(errs, fmt.Sprintf("removing nft table: %v", err))
-	} else {
-		printOK("Network jail rules removed.")
+	if j.proxyContainerID != "" || j.proxyContainerName != "" {
+		if err := removeContainerByName(j.proxyContainerName); err != nil {
+			errs = append(errs, fmt.Sprintf("removing proxy sidecar: %v", err))
+		} else {
+			printOK("Network proxy sidecar removed.")
+		}
+	}
+
+	if j.policyFilePath != "" {
+		_ = os.Remove(j.policyFilePath)
 	}
 
 	if j.networkID != "" {
@@ -212,96 +227,155 @@ func (j *NetworkJail) Cleanup() error {
 	return nil
 }
 
-// writeNftRules creates an nft table that allows traffic to the resolved IPs
-// and drops everything else forwarded through the bridge.
-func (j *NetworkJail) writeNftRules() error {
-	tmpFile, err := os.CreateTemp("", "smith-jail-nft-*.rules")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmpFile.Name())
+// ── nft rules ─────────────────────────────────────────────────────────────
 
-	if _, err := tmpFile.WriteString(j.nftRules()); err != nil {
-		tmpFile.Close()
-		return err
+// requireNftRedirModule fails fast — before any images are built or Docker
+// resources are created — if the kernel's nft_redir module isn't loaded or
+// built in. It can only auto-load from the host's own network namespace,
+// not the isolated one runNetsetup's rules run inside, so on a host that
+// hasn't loaded it since boot, the jail would otherwise fail deep into
+// setup (after building images, creating the network, and starting the
+// proxy sidecar) with a cryptic nft parse error instead of a clear message
+// up front. See checkNftRedirModule (doctor.go) for the equivalent
+// informational check.
+//
+// If the check itself is inconclusive (neither /proc/modules nor
+// modules.builtin could be read), it doesn't block — an unusual host layout
+// isn't grounds to refuse a run that might well succeed.
+func requireNftRedirModule() error {
+	loaded, loadedErr := kernelModuleLoaded("nft_redir")
+	if loadedErr == nil && loaded {
+		return nil
 	}
-	tmpFile.Close()
+	builtin, builtinErr := kernelModuleBuiltin("nft_redir")
+	if builtinErr == nil && builtin {
+		return nil
+	}
+	if loadedErr != nil && builtinErr != nil {
+		return nil
+	}
 
-	nft, err := findNft()
-	if err != nil {
-		return err
-	}
-	cmd := exec.Command(nft, "-f", tmpFile.Name())
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	return fmt.Errorf("kernel module nft_redir is not loaded\n\n" +
+		"--network-jail's nftables rules run inside an isolated per-session network\n" +
+		"namespace, and the kernel only auto-loads nft modules for requests made from\n" +
+		"the host's own namespace — so this needs to be loaded once per boot before\n" +
+		"the jail can start.\n\n" +
+		"Run:\n" +
+		"    sudo modprobe nft_redir\n")
 }
 
-// nftRules renders the ruleset for this session. Both the table name and the
-// interface the rules match on are session-scoped, so concurrent jails filter
-// independently and tear down independently.
-func (j *NetworkJail) nftRules() string {
-	var sb strings.Builder
+// nftRules renders the ruleset the netsetup helper applies inside the
+// shared network namespace. It's entirely static — no per-session bridge
+// name or resolved IP set to bake in, unlike the host-nft design this
+// replaces — because enforcement no longer depends on the identity of any
+// interface, only on which local UID the traffic belongs to.
+//
+// Ordering matters: the nat/output hook (priority -100) runs before the
+// filter/output hook (priority 0), so by the time the filter chain sees a
+// redirected packet, its destination has already been rewritten to
+// loopback. That's why the filter chain doesn't need to separately allow
+// ports 80/443/53 — anything that reached them was redirected to loopback
+// already, and everything else is refused by the default policy.
+//
+// The filter chain matches the redirected traffic by destination address
+// (ip daddr 127.0.0.1), not by output interface (oif "lo"). They sound
+// equivalent — a packet redirected to loopback should surely have oif
+// "lo" — but they aren't: address rewriting is part of the NAT verdict
+// itself and is visible immediately to every later rule in the same hook,
+// while for a TCP SYN specifically, oif can still reflect the pre-redirect
+// route (e.g. eth0) at the point the filter chain — same hook, later
+// priority — evaluates it, so "oif lo accept" silently fails to match and
+// the packet falls through to the default-drop policy even though it was
+// genuinely redirected. UDP doesn't hit this (its oif does update in time),
+// which is why DNS worked throughout while TCP silently died — traced by
+// hand, painfully, since this drop happens before conntrack even confirms
+// the entry, so there's nothing to see in "cat /proc/net/nf_conntrack" or a
+// packet capture: it just looks like the SYN vanishes.
+//
+// Family is "ip", not "inet": the dual-stack "inet" family only grew NAT
+// support (redirect/dnat/snat) in later kernels and its availability is
+// inconsistent, while "ip" has had it since nftables' earliest releases. The
+// jail's Docker network already disables IPv6 (see createDockerNetwork), so
+// there's no dual-stack requirement to justify "inet"'s narrower kernel
+// support here.
+func nftRules() string {
+	return fmt.Sprintf(`table ip smithjail {
+  chain output {
+    type nat hook output priority -100; policy accept;
+    meta skuid %d return
+    udp dport 53 redirect to :%s
+    tcp dport 80 redirect to :%s
+    tcp dport 443 redirect to :%s
+  }
 
-	sb.WriteString(fmt.Sprintf("table inet %s {\n", j.nftTableName))
-	sb.WriteString("  set allowed_ips {\n")
-	sb.WriteString("    type ipv4_addr\n")
-	sb.WriteString("    flags interval\n")
-	sb.WriteString("    elements = {")
-	sb.WriteString(strings.Join(j.resolvedIPs, ", "))
-	sb.WriteString("}\n  }\n\n")
-
-	sb.WriteString("  chain forward {\n")
-	sb.WriteString("    type filter hook forward priority 0; policy accept;\n")
-	sb.WriteString(fmt.Sprintf("    iifname \"%s\" ct state established,related accept\n", j.bridgeIface))
-	sb.WriteString(fmt.Sprintf("    iifname \"%s\" ip daddr @allowed_ips accept\n", j.bridgeIface))
-	sb.WriteString(fmt.Sprintf("    iifname \"%s\" drop\n", j.bridgeIface))
-	sb.WriteString("  }\n")
-	sb.WriteString("}\n")
-
-	return sb.String()
+  chain block {
+    type filter hook output priority 0; policy drop;
+    meta skuid %d accept
+    ip daddr 127.0.0.1 accept
+    ct state established,related accept
+  }
+}
+`, proxyproto.ProxyUID, proxyproto.DNSPort, proxyproto.HTTPPort, proxyproto.TLSPort, proxyproto.ProxyUID)
 }
 
-// ── Docker network helpers ─────────────────────────────────────────────────
+// ── policy file ───────────────────────────────────────────────────────────
 
-// createDockerNetwork creates the session's bridge network. The bridge
-// interface name is supplied by the caller and must be unique per session: the
-// kernel allows only one interface of a given name, so a fixed name limited the
-// whole machine to a single jailed session at a time.
-func createDockerNetwork(name, bridge, dir, agentName string) (networkID, bridgeIface string, err error) {
+// writePolicyFile writes the effective allow-list to a temp file, bind-mounted
+// read-only into the proxy sidecar at proxyproto.PolicyFilePath.
+func writePolicyFile(hosts []string) (string, error) {
+	f, err := os.CreateTemp("", "smithjail-policy-*.json")
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	// The proxy sidecar reads this bind-mounted file as UID 5353, not the
+	// host user running smith-jail (often root), so it must be
+	// world-readable — the default 0600 from CreateTemp leaves it
+	// unreadable to the container.
+	if err := f.Chmod(0o644); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+
+	cfg := proxyproto.PolicyConfig{AllowedHosts: hosts}
+	if err := json.NewEncoder(f).Encode(cfg); err != nil {
+		os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
+// ── Docker helpers ───────────────────────────────────────────────────────
+
+// createDockerNetwork creates the session's bridge network: a plain,
+// WAN-reachable network like an unjailed session would use — enforcement
+// comes entirely from the nft rules inside the shared namespace, not from
+// any network-level isolation, so there's nothing special about this
+// network beyond being scoped to one session. IPv6 is disabled: the relay's
+// SO_ORIGINAL_DST handling only covers IPv4 for now.
+func createDockerNetwork(name, dir, agentName string) (networkID string, err error) {
 	cli, err := dockerClient()
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	defer cli.Close()
 
 	_ = removeDockerNetworkByName(cli, name)
 
+	ipv6 := false
 	resp, err := cli.NetworkCreate(context.Background(), name, network.CreateOptions{
-		Driver: "bridge",
+		Driver:     "bridge",
+		EnableIPv6: &ipv6,
 		Labels: map[string]string{
 			"smithjail.project": dir,
 			"smithjail.agent":   agentName,
 		},
-		Options: map[string]string{
-			"com.docker.network.bridge.name": bridge,
-		},
 	})
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
-
-	nr, err := cli.NetworkInspect(context.Background(), resp.ID, network.InspectOptions{})
-	if err != nil {
-		return resp.ID, bridge, nil
-	}
-
-	iface := bridge
-	if v, ok := nr.Options["com.docker.network.bridge.name"]; ok {
-		iface = v
-	}
-
-	return resp.ID, iface, nil
+	return resp.ID, nil
 }
 
 func removeDockerNetwork(networkID string) error {
@@ -313,151 +387,99 @@ func removeDockerNetwork(networkID string) error {
 	return cli.NetworkRemove(context.Background(), networkID)
 }
 
-func removeDockerNetworkByName(cli *client.Client, name string) error {
+func removeDockerNetworkByName(cli dockerNetworkRemover, name string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return cli.NetworkRemove(ctx, name)
 }
 
-// ── nft helpers ───────────────────────────────────────────────────────────
+// dockerNetworkRemover is the one *client.Client method removeDockerNetworkByName
+// needs, kept narrow so it doesn't need to import the client package just
+// for a type name here.
+type dockerNetworkRemover interface {
+	NetworkRemove(ctx context.Context, network string) error
+}
 
-func nftRun(args ...string) error {
-	nft, err := findNft()
+// startProxyContainer starts the session's proxy sidecar, detached, on
+// networkName, with the policy file bind-mounted read-only.
+func startProxyContainer(networkName, containerName, policyPath, eventLogPath, proxyTag string, agent *Agent, dir string) (containerID string, err error) {
+	args := []string{
+		"run", "-d",
+		"--name", containerName,
+		"--network", networkName,
+		"--label", "smithjail.proxy=" + containerName,
+		"--label", "smithjail.role=proxy",
+		"--label", "smithjail.project=" + dir,
+		"--label", "smithjail.agent=" + agent.Name,
+		"--volume", labelledMount(policyPath, proxyproto.PolicyFilePath, mountLabel(), "ro"),
+		"--volume", labelledMount(eventLogPath, proxyproto.EventLogPath, mountLabel()),
+		"--env", proxyproto.EventLogEnv + "=" + proxyproto.EventLogPath,
+		proxyTag,
+	}
+	out, err := exec.Command("docker", args...).Output()
+	if err != nil {
+		return "", dockerRunError(err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// waitProxyReady polls the proxy's logs for proxyproto.ReadyMarker so the
+// netsetup helper never installs redirect rules before anything is
+// listening for the traffic they redirect.
+func waitProxyReady(containerName string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		out, _ := exec.Command("docker", "logs", containerName).CombinedOutput()
+		if strings.Contains(string(out), proxyproto.ReadyMarker) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("proxy sidecar did not report ready within %s (last logs:\n%s)", timeout, out)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// runNetsetup runs the one-shot rule-installation helper: it joins the
+// proxy's network namespace and nothing else's, is granted NET_ADMIN only
+// for this single invocation, and is removed the moment it exits.
+func runNetsetup(proxyContainerName, netsetupTag, rules string) error {
+	cmd := exec.Command("docker", "run", "--rm", "-i",
+		"--network", "container:"+proxyContainerName,
+		"--cap-add", "NET_ADMIN",
+		netsetupTag,
+	)
+	cmd.Stdin = strings.NewReader(rules)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if strings.Contains(string(out), "Could not process rule") && strings.Contains(string(out), "redirect") {
+			return fmt.Errorf("%w\n%s\nThe kernel's nft_redir module is likely not loaded — it can only "+
+				"auto-load from the host's own network namespace, not this rule's isolated one. "+
+				"Run: sudo modprobe nft_redir (see `smith-jail doctor`)", err, out)
+		}
+		return fmt.Errorf("%w\n%s", err, out)
+	}
+	return nil
+}
+
+func removeContainerByName(name string) error {
+	cli, err := dockerClient()
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(nft, args...)
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	defer cli.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return cli.ContainerRemove(ctx, name, container.RemoveOptions{Force: true})
 }
 
-// nftListTables returns the names of all inet tables in the ruleset.
-func nftListTables() ([]string, error) {
-	nft, err := findNft()
-	if err != nil {
-		return nil, err
+func dockerRunError(err error) error {
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return fmt.Errorf("docker run failed: %s", strings.TrimSpace(string(exitErr.Stderr)))
 	}
-	out, err := exec.Command(nft, "list", "tables", "inet").Output()
-	if err != nil {
-		return nil, err
-	}
-	return parseNftTables(string(out)), nil
-}
-
-// parseNftTables extracts table names from "nft list tables inet" output.
-func parseNftTables(out string) []string {
-	var names []string
-	for _, line := range strings.Split(out, "\n") {
-		// Lines look like: table inet smithjail-claude-a1b2c3d4
-		fields := strings.Fields(line)
-		if len(fields) == 3 && fields[0] == "table" && fields[1] == "inet" {
-			names = append(names, fields[2])
-		}
-	}
-	return names
-}
-
-// pruneStaleNftTables removes smith-jail firewall rules whose session is gone.
-//
-// A table is judged solely by whether the bridge interface its rules filter on
-// still exists. That is the one signal that cannot produce a false positive: if
-// the interface is present the session is live, and the table is left strictly
-// alone. Deleting a live table would silently drop the firewall around a
-// running agent, so ambiguity always resolves to "leave it".
-func pruneStaleNftTables() {
-	tables, err := nftListTables()
-	if err != nil {
-		return
-	}
-
-	for _, table := range staleNftTables(tables, ifaceExists) {
-		if err := nftRun("delete", "table", "inet", table); err == nil {
-			printInfo("Removed stale network jail rules: " + table)
-		}
-	}
-}
-
-// staleNftTables selects the tables that are ours and whose session is gone.
-// Everything else — foreign tables, and ours whose bridge is still up — is
-// omitted, so the caller can only ever delete rules nothing is relying on.
-func staleNftTables(tables []string, exists func(string) bool) []string {
-	var stale []string
-	for _, table := range tables {
-		iface, ok := bridgeForTable(table)
-		if !ok {
-			continue // not ours: never touch it
-		}
-		if exists(iface) {
-			continue // bridge is up, so the session owning it is still live
-		}
-		stale = append(stale, table)
-	}
-	return stale
-}
-
-func ifaceExists(name string) bool {
-	_, err := net.InterfaceByName(name)
-	return err == nil
-}
-
-// bridgeForTable maps one of our nft table names back to the bridge interface
-// its rules filter on. It reports false for anything not clearly ours.
-func bridgeForTable(table string) (string, bool) {
-	if !strings.HasPrefix(table, nftTablePrefix) {
-		return "", false
-	}
-
-	suffix := table[strings.LastIndex(table, "-")+1:]
-	if isSessionID(suffix) {
-		return bridgeIfaceName(suffix), true
-	}
-	// Tables from builds predating session IDs were all named "<agent>-session"
-	// and shared the one fixed bridge.
-	if suffix == "session" {
-		return legacyBridgeIface, true
-	}
-	return "", false
-}
-
-func isSessionID(s string) bool {
-	if len(s) != sessionIDLen {
-		return false
-	}
-	return strings.Trim(s, "0123456789abcdef") == ""
-}
-
-// ── IP resolution ─────────────────────────────────────────────────────────
-
-func resolveHosts(hosts []string) ([]string, error) {
-	seen := make(map[string]bool)
-	var ips []string
-
-	for _, host := range hosts {
-		host = strings.TrimSpace(host)
-		if host == "" {
-			continue
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		addrs, err := net.DefaultResolver.LookupHost(ctx, host)
-		cancel()
-
-		if err != nil {
-			printWarn(fmt.Sprintf("Cannot resolve %s: %v (skipping)", host, err))
-			continue
-		}
-
-		for _, addr := range addrs {
-			if ip := net.ParseIP(addr); ip != nil && ip.To4() != nil {
-				if !seen[addr] {
-					seen[addr] = true
-					ips = append(ips, addr)
-				}
-			}
-		}
-	}
-
-	return ips, nil
+	return err
 }
 
 // ── Allow file ────────────────────────────────────────────────────────────
@@ -479,19 +501,4 @@ func readAllowFile(path string) ([]string, error) {
 		hosts = append(hosts, line)
 	}
 	return hosts, scanner.Err()
-}
-
-// ── Capability check ──────────────────────────────────────────────────────
-
-func checkNetAdmin() error {
-	nft, err := findNft()
-	if err != nil {
-		return err
-	}
-	cmd := exec.Command(nft, "list", "tables")
-	cmd.Stderr = nil
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("cannot run nft — missing NET_ADMIN capability or not root")
-	}
-	return nil
 }

@@ -32,6 +32,7 @@ const (
 	actionNone actionKind = iota
 	actionRun
 	actionShell
+	actionNetView
 )
 
 // tuiAction is a request the TUI hands back to cmdTUI once it has released the
@@ -62,15 +63,20 @@ func cmdTUI() {
 		return
 	}
 
-	rememberProject(action.Dir)
-
 	// The TUI is fully torn down at this point: stdout is the real terminal
 	// again, and the prompts inside cmdRun/cmdShell work as they always do.
 	switch action.Kind {
 	case actionRun:
+		rememberProject(action.Dir)
 		cmdRun(action.Agent, action.Dir, &InvokeOptions{}, nil)
 	case actionShell:
+		rememberProject(action.Dir)
 		cmdShell(action.Agent, action.Dir, &InvokeOptions{}, nil)
+	case actionNetView:
+		// Passively watching a session's traffic doesn't count as "using"
+		// the project the way launching one does — rememberProject is
+		// deliberately skipped here.
+		cmdNetView(action.Agent, action.Dir)
 	}
 }
 

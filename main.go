@@ -52,9 +52,24 @@ Commands (per agent):
   run        [flags] <dir>          Launch the agent in the given directory
   shell      [flags] <dir>          Open a shell in the container
   setup      [flags] [dir] [args]   Run the agent's own setup/login inside the container (default dir: cwd)
+  netlog     [flags] [dir]          Print a project's network jail activity log (default dir: cwd)
+  netview    [dir]                  Live TUI view of a project's network jail activity (default dir: cwd)
   dockerfile [dir]                  Print the generated Dockerfile for dir's configuration (default: cwd)
   rebuild    [--yes] [dir]          Rebuild the Docker image for dir's configuration (default: cwd)
   clean      [dir]                  Remove containers/volumes for a project, or all images/containers for this agent
+
+Flags (netlog):
+  --follow                Keep tailing new events (like tail -f)
+  --blocked-only          Show only blocked/failed events
+
+netlog and netview read a project's persisted network activity log — every
+DNS query and TCP connection the network jail's proxy sidecar saw, allowed
+or blocked — from disk, independent of whether a session is currently
+running. Since smith-jail's own terminal is occupied for the whole run of
+"run"/"shell", run these in a second terminal or tmux pane to watch a live
+session, e.g.:
+  smith-jail claude netview .
+  smith-jail claude netlog --follow --blocked-only .
 
 Flags (run, shell, and setup):
   --network-jail          Restrict outbound network to the agent's API only (Linux only)
@@ -174,6 +189,17 @@ func cmdAgent(agent *Agent, args []string) {
 		opts, dir, extraArgs := parseSetupFlags(args[1:], agent.Name+" setup")
 		cmdSetup(agent, dir, opts, extraArgs)
 
+	case "netlog":
+		follow, blockedOnly, dir := parseNetLogFlags(args[1:], agent.Name+" netlog")
+		cmdNetLog(agent, dir, follow, blockedOnly)
+
+	case "netview":
+		dir := "."
+		if len(args) > 1 {
+			dir = args[1]
+		}
+		cmdNetView(agent, dir)
+
 	case "dockerfile":
 		cmdDockerfile(agent, args[1:])
 
@@ -190,6 +216,61 @@ func cmdAgent(agent *Agent, args []string) {
 	default:
 		die(fmt.Sprintf("Unknown %s command: %s\n  Run: smith-jail help", agent.Name, args[0]))
 	}
+}
+
+// reorderKnownFlags moves any occurrence of a flag defined on fs — along
+// with its value, wherever it appears in args — to the front, preserving
+// the relative order of everything else. This makes fs.Parse order-
+// independent: Go's flag package otherwise stops parsing at the first
+// argument that doesn't look like a flag, so e.g. "run <dir> --network-jail"
+// would leave --network-jail in the leftover positional args instead of
+// being recognized, and it would silently pass through to the wrapped
+// agent's own CLI instead of configuring smith-jail. A bare "--" ends the
+// scan and everything from it onward (including the "--" itself) is left
+// untouched, so it still works as an escape hatch for literally passing a
+// smith-jail-flag-shaped argument through to the agent.
+func reorderKnownFlags(fs *flag.FlagSet, args []string) []string {
+	var known, rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			rest = append(rest, args[i:]...)
+			break
+		}
+
+		name := ""
+		switch {
+		case strings.HasPrefix(a, "--"):
+			name = a[2:]
+		case strings.HasPrefix(a, "-") && len(a) > 1:
+			name = a[1:]
+		default:
+			rest = append(rest, a)
+			continue
+		}
+		hasValue := false
+		if eq := strings.IndexByte(name, '='); eq >= 0 {
+			name = name[:eq]
+			hasValue = true
+		}
+
+		f := fs.Lookup(name)
+		if f == nil {
+			rest = append(rest, a)
+			continue
+		}
+		known = append(known, a)
+
+		isBool := false
+		if b, ok := f.Value.(interface{ IsBoolFlag() bool }); ok {
+			isBool = b.IsBoolFlag()
+		}
+		if !hasValue && !isBool && i+1 < len(args) {
+			i++
+			known = append(known, args[i])
+		}
+	}
+	return append(known, rest...)
 }
 
 // parseCommonFlags parses the flags shared by run, shell, and setup, and
@@ -210,7 +291,7 @@ func parseCommonFlags(args []string, cmd string) (*InvokeOptions, []string) {
 	fs.Usage = func() {
 		fmt.Print(helpText)
 	}
-	_ = fs.Parse(args)
+	_ = fs.Parse(reorderKnownFlags(fs, args))
 
 	opts := &InvokeOptions{
 		NetworkJail: *networkJail,
@@ -318,14 +399,16 @@ func prepareContainer(agent *Agent, cfg *Config, opts *InvokeOptions, dir string
 	return jail, cleanup, true
 }
 
-// networkArgFor returns the docker --network value for a session: the jail's
-// dedicated network if one was created, otherwise the default bridge — except
-// for hermes-local, which uses its own persistent network instead of the
-// default bridge so it can reach the Ollama sidecar by container name (the
-// default "bridge" network has no embedded DNS). See ollama.go.
+// networkArgFor returns the docker --network value for the agent container:
+// when the jail is active, that means joining the proxy sidecar's namespace
+// entirely (see NetworkJail.NetworkArg) rather than getting its own network
+// attachment. Otherwise it's the default bridge — except for hermes-local,
+// which uses its own persistent network instead of the default bridge so it
+// can reach the Ollama sidecar by container name (the default "bridge"
+// network has no embedded DNS). See ollama.go.
 func networkArgFor(agent *Agent, jail *NetworkJail) string {
 	if jail != nil {
-		return jail.DockerNetworkName()
+		return jail.NetworkArg()
 	}
 	if agent.Name == "hermes-local" {
 		return OllamaNetworkName
@@ -363,7 +446,15 @@ func prepareOllamaSidecar(agent *Agent, cfg *Config, jail *NetworkJail) bool {
 	if err := SeedHermesLocalConfig(cfg); err != nil {
 		printWarn("Could not seed hermes-local config.yaml: " + err.Error())
 	}
-	if err := ConnectOllamaToNetwork(networkArgFor(agent, jail)); err != nil {
+	// Unlike networkArgFor (which the agent container uses to *join* the
+	// proxy's namespace via "container:<proxy>"), Ollama needs the real
+	// underlying network name — it's a genuinely separate container, not
+	// something that can share another container's namespace.
+	ollamaNet := OllamaNetworkName
+	if jail != nil {
+		ollamaNet = jail.NetworkName()
+	}
+	if err := ConnectOllamaToNetwork(ollamaNet); err != nil {
 		printWarn("Could not attach Ollama sidecar to session network: " + err.Error())
 	}
 	return true
@@ -395,6 +486,11 @@ func runAndSummarize(agent *Agent, dir string, cfg *Config, run func() (int, err
 
 func cmdRun(agent *Agent, rawDir string, opts *InvokeOptions, extraArgs []string) {
 	dir, cfg := resolveSession(agent, rawDir, opts)
+
+	if !doctorGate(cfg) {
+		printInfo("Aborted.")
+		return
+	}
 
 	jail, cleanup, ok := prepareContainer(agent, cfg, opts, dir)
 	defer cleanup()

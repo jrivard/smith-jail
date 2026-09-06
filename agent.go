@@ -98,6 +98,17 @@ var (
 	AllAgents = []*Agent{AgentClaude, AgentGemini, AgentCodex, AgentHermes, AgentHermesLocal}
 )
 
+// AgentByName returns the agent with the given Name, or nil if none matches
+// — e.g. resolving a container's "smithjail.agent" label back to an *Agent.
+func AgentByName(name string) *Agent {
+	for _, a := range AllAgents {
+		if a.Name == name {
+			return a
+		}
+	}
+	return nil
+}
+
 // ImageName returns the Docker repository name for this agent. A given
 // repository can hold several tags — one per distinct effective
 // configuration (see ImageRef) — since base image, packages, and root/sudo

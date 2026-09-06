@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -27,7 +28,13 @@ import (
 type screen int
 
 const (
+	// screenDashboard is the sessions overview — the true top level: active
+	// sessions, "New session ▸", and agent/directory-independent utilities.
 	screenDashboard screen = iota
+	// screenNewSession is the submenu everything about configuring/launching
+	// a session for the currently selected agent+directory now lives in —
+	// what screenDashboard used to be, before it grew a sessions overview.
+	screenNewSession
 	screenPicker
 	screenPackages
 	screenSettings
@@ -82,9 +89,17 @@ type rootModel struct {
 	artifacts     artifactsModel
 	recentsLoaded bool
 
-	// hubCursor is the highlighted row of the always-focused list on the
-	// dashboard — the single entry point into everything the TUI can do.
+	// hubCursor is the highlighted row of screenNewSession's always-focused
+	// list.
 	hubCursor int
+
+	// dashCursor is the highlighted row of screenDashboard's list: active
+	// sessions, then "New session ▸", then dashGlobalItems, all in one flat
+	// index.
+	dashCursor     int
+	sessions       []activeSession
+	sessionsLoaded bool
+	sessionsErr    error
 
 	checkingUpdates bool
 
@@ -124,6 +139,15 @@ type versionsMsg struct {
 	installed string
 	latest    string
 }
+
+// activeSessionsMsg carries a fresh ListActiveSessions() result.
+type activeSessionsMsg struct {
+	sessions []activeSession
+	err      error
+}
+
+// activeSessionsTickMsg fires the sessions overview's periodic refresh.
+type activeSessionsTickMsg struct{}
 
 // ── Construction ──────────────────────────────────────────────────────────────
 
@@ -172,14 +196,75 @@ func (m rootModel) recentProjectFor(dir string) (recentProject, bool) {
 	return recentProject{}, false
 }
 
-// updateHub handles a keystroke on the dashboard's always-focused list — the
-// only input owner that screen has. There is no separate "menu" mode to step
-// into or out of: up/down always move the highlight, enter/space always
-// activates whatever row it is on.
-func (m rootModel) updateHub(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+// updateDashboard handles a keystroke on the top-level sessions overview:
+// active sessions, then "New session ▸", then dashGlobalItems, all under one
+// flat cursor. This is the true root screen — esc/q here quits the app,
+// unlike screenNewSession's esc/q, which only steps back up to here.
+func (m rootModel) updateDashboard(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	total := len(m.sessions) + 1 + len(dashGlobalItems) // +1 for "New session ▸"
+
 	switch msg.String() {
 	case "ctrl+c", "q", "esc":
 		return m, tea.Quit
+
+	case "up", "k":
+		if m.dashCursor > 0 {
+			m.dashCursor--
+		}
+		return m, nil
+
+	case "down", "j":
+		if m.dashCursor < total-1 {
+			m.dashCursor++
+		}
+		return m, nil
+
+	case "enter", " ":
+		return m.activateDashboard()
+	}
+	return m, nil
+}
+
+// activateDashboard performs whatever the highlighted top-level row
+// promises: open netview for a session, enter the New Session submenu, or
+// hand off to activateHub for a global row.
+func (m rootModel) activateDashboard() (tea.Model, tea.Cmd) {
+	switch {
+	case m.dashCursor < len(m.sessions):
+		s := m.sessions[m.dashCursor]
+		m.action = &tuiAction{Kind: actionNetView, Agent: s.Agent, Dir: s.Dir}
+		return m, tea.Quit
+
+	case m.dashCursor == len(m.sessions):
+		m.hubCursor = 0
+		m.screen = screenNewSession
+		return m, nil
+
+	default:
+		row := dashGlobalItems[m.dashCursor-len(m.sessions)-1].row
+		return m.activateHub(row)
+	}
+}
+
+// enterDashboard returns to the top-level sessions overview and kicks off a
+// fresh, immediate refresh (plus restarting the periodic tick) rather than
+// waiting out whatever's left of the previous refresh interval.
+func (m rootModel) enterDashboard() (tea.Model, tea.Cmd) {
+	m.screen = screenDashboard
+	return m, tea.Batch(activeSessionsCmd(), activeSessionsTickCmd())
+}
+
+// updateNewSessionMenu handles a keystroke on the "New session" submenu's
+// always-focused list — Run, Shell, and everything that configures a
+// session for the currently selected agent+directory. Esc/q steps back up
+// to the dashboard rather than quitting (ctrl+c still quits outright).
+func (m rootModel) updateNewSessionMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c":
+		return m, tea.Quit
+
+	case "esc", "q":
+		return m.enterDashboard()
 
 	case "up", "k":
 		if m.hubCursor > 0 {
@@ -188,20 +273,24 @@ func (m rootModel) updateHub(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "down", "j":
-		if m.hubCursor < len(hubItems)-1 {
+		if m.hubCursor < len(newSessionItems)-1 {
 			m.hubCursor++
 		}
 		return m, nil
 
 	case "enter", " ":
-		return m.activateHub()
+		return m.activateHub(newSessionItems[m.hubCursor].row)
 	}
 	return m, nil
 }
 
-// activateHub performs whatever the highlighted row promises.
-func (m rootModel) activateHub() (tea.Model, tea.Cmd) {
-	switch hubItems[m.hubCursor].row {
+// activateHub performs whatever row promises — shared by the New Session
+// submenu (Run/Shell/Change agent/Change project/Settings/Ollama
+// model/Dockerfile) and the dashboard's global rows (Docker
+// artifacts/Check updates/Doctor/Help/Quit); each caller only ever passes a
+// row it actually owns.
+func (m rootModel) activateHub(row hubRow) (tea.Model, tea.Cmd) {
+	switch row {
 	case rowRun:
 		return m.launch(actionRun)
 	case rowShell:
@@ -242,15 +331,15 @@ func (m rootModel) activateHub() (tea.Model, tea.Cmd) {
 }
 
 // updateAgentPicker handles a keystroke on the agent-selection screen: an
-// always-focused list, same shape as the dashboard hub, just scoped to
-// AllAgents.
+// always-focused list, same shape as the New Session submenu, just scoped to
+// AllAgents. Reached only from within New Session, so it steps back there.
 func (m rootModel) updateAgentPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "ctrl+c":
 		return m, tea.Quit
 
 	case "esc", "q":
-		m.screen = screenDashboard
+		m.screen = screenNewSession
 		return m, nil
 
 	case "up", "k":
@@ -268,7 +357,7 @@ func (m rootModel) updateAgentPicker(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "enter", " ":
 		m.agentIdx = m.agentCursor
 		m.status = ""
-		m.screen = screenDashboard
+		m.screen = screenNewSession
 		return m, nil
 	}
 	return m, nil
@@ -326,13 +415,30 @@ func (m rootModel) triggerUpdates() (tea.Model, tea.Cmd) {
 }
 
 func (m rootModel) Init() tea.Cmd {
-	return tea.Batch(checkDockerCmd(), loadRecentsCmd())
+	return tea.Batch(checkDockerCmd(), loadRecentsCmd(), activeSessionsCmd(), activeSessionsTickCmd())
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
 
 func checkDockerCmd() tea.Cmd {
 	return func() tea.Msg { return dockerCheckedMsg{err: CheckDocker()} }
+}
+
+func activeSessionsCmd() tea.Cmd {
+	return func() tea.Msg {
+		sessions, err := ListActiveSessions()
+		return activeSessionsMsg{sessions: sessions, err: err}
+	}
+}
+
+// activeSessionsRefreshInterval bounds how quickly the sessions overview
+// notices a session starting or exiting. A live human is watching a list,
+// not a monitoring pipeline, so a few seconds' staleness is unnoticeable
+// and keeps this from hammering the Docker daemon.
+const activeSessionsRefreshInterval = 3 * time.Second
+
+func activeSessionsTickCmd() tea.Cmd {
+	return tea.Tick(activeSessionsRefreshInterval, func(time.Time) tea.Msg { return activeSessionsTickMsg{} })
 }
 
 func imageInfoCmd(a *Agent, cfg *Config) tea.Cmd {
@@ -403,9 +509,24 @@ func (m rootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.recentsLoaded = true
 		return m, nil
 
+	case activeSessionsMsg:
+		m.sessions = msg.sessions
+		m.sessionsErr = msg.err
+		m.sessionsLoaded = true
+		if m.dashCursor > len(m.sessions)+1+len(dashGlobalItems)-1 {
+			m.dashCursor = 0
+		}
+		return m, nil
+
+	case activeSessionsTickMsg:
+		if m.screen != screenDashboard {
+			return m, nil
+		}
+		return m, tea.Batch(activeSessionsCmd(), activeSessionsTickCmd())
+
 	case dirChosenMsg:
 		m.dir = msg.dir
-		m.screen = screenDashboard
+		m.screen = screenNewSession
 		m.status = ""
 		// Project overrides are keyed by directory, so switching projects
 		// requires re-layering config, not just remembering the new path.
@@ -510,12 +631,18 @@ func (m rootModel) routeKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // back" transition.
 func (m rootModel) routeKeyOne(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.screen {
+	case screenDashboard:
+		return m.updateDashboard(msg)
+
+	case screenNewSession:
+		return m.updateNewSessionMenu(msg)
+
 	case screenPicker:
 		p, cmd := m.picker.Update(msg)
 		m.picker = p
 		if p.cancelled {
 			m.picker.cancelled = false
-			m.screen = screenDashboard
+			m.screen = screenNewSession
 		}
 		return m, cmd
 
@@ -524,7 +651,7 @@ func (m rootModel) routeKeyOne(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.packages = p
 		if p.cancelled {
 			// Packages is only reached from within Settings now, so "back"
-			// returns there rather than all the way out to the dashboard.
+			// returns there rather than all the way out to New Session.
 			m.packages.cancelled = false
 			m.screen = screenSettings
 		}
@@ -542,7 +669,7 @@ func (m rootModel) routeKeyOne(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if s.cancelled {
 			m.settings.cancelled = false
-			m.screen = screenDashboard
+			m.screen = screenNewSession
 		}
 		return m, cmd
 
@@ -551,7 +678,7 @@ func (m rootModel) routeKeyOne(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.modelPicker = p
 		if p.cancelled {
 			m.modelPicker.cancelled = false
-			m.screen = screenDashboard
+			m.screen = screenNewSession
 		}
 		return m, cmd
 
@@ -560,7 +687,7 @@ func (m rootModel) routeKeyOne(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.artifacts = a
 		if a.cancelled {
 			m.artifacts.cancelled = false
-			m.screen = screenDashboard
+			return m.enterDashboard()
 		}
 		return m, cmd
 
@@ -586,7 +713,7 @@ func (m rootModel) routeKeyOne(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.dockerfileScroll += m.dockerfileVisibleLines()
 			return m, nil
 		default:
-			m.screen = screenDashboard
+			m.screen = screenNewSession
 			return m, nil
 		}
 
@@ -594,21 +721,19 @@ func (m rootModel) routeKeyOne(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
-		m.screen = screenDashboard
-		return m, nil
+		return m.enterDashboard()
 
 	case screenHelp:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
-		m.screen = screenDashboard
-		return m, nil
+		return m.enterDashboard()
 
 	case screenAgentPicker:
 		return m.updateAgentPicker(msg)
 	}
 
-	return m.updateHub(msg)
+	return m.updateDashboard(msg)
 }
 
 // launch validates the current selection and, if it holds up, quits the program
@@ -637,6 +762,8 @@ func (m rootModel) View() string {
 
 	var body string
 	switch m.screen {
+	case screenNewSession:
+		body = m.viewNewSessionMenu()
 	case screenPackages:
 		body = m.packages.View()
 	case screenSettings:
@@ -786,7 +913,7 @@ func (m rootModel) viewDoctor() string {
 }
 
 // viewAgentPicker renders the agent-selection screen: one always-focused
-// list, same rendering approach as the dashboard hub (renderHubList).
+// list, same rendering approach as the New Session submenu (renderNewSessionList).
 func (m rootModel) viewAgentPicker() string {
 	width := 60
 	if m.width > 0 {
@@ -819,6 +946,8 @@ func (m rootModel) viewAgentPicker() string {
 	return b.String()
 }
 
+// viewDashboardBody renders the top-level sessions overview: active
+// sessions, "New session ▸", and agent/directory-independent utilities.
 func (m rootModel) viewDashboardBody() string {
 	var b strings.Builder
 
@@ -829,10 +958,33 @@ func (m rootModel) viewDashboardBody() string {
 	b.WriteString(m.renderDockerStatus())
 	b.WriteString("\n\n")
 
+	b.WriteString(m.renderSessionsList())
+	b.WriteString("\n\n")
+
+	if m.status != "" {
+		b.WriteString(styleWarn.Render("! " + m.status))
+		b.WriteString("\n\n")
+	}
+
+	b.WriteString(helpLine("↑/↓", "move", "enter", "select", "esc", "quit"))
+
+	return b.String()
+}
+
+// viewNewSessionMenu renders the submenu everything about configuring or
+// launching a session for the currently selected agent+directory lives in
+// — what the dashboard itself used to be before it grew a sessions
+// overview.
+func (m rootModel) viewNewSessionMenu() string {
+	var b strings.Builder
+
+	b.WriteString(styleTitle.Render("New session"))
+	b.WriteString("\n\n")
+
 	b.WriteString(m.renderReadyBanner())
 	b.WriteString("\n\n")
 
-	b.WriteString(m.renderHubList())
+	b.WriteString(m.renderNewSessionList())
 	b.WriteString("\n\n")
 
 	if details := m.renderSessionDetails(); details != "" {
@@ -847,7 +999,7 @@ func (m rootModel) viewDashboardBody() string {
 
 	b.WriteString(stylePreview.Render(m.renderPreview()))
 	b.WriteString("\n\n")
-	b.WriteString(helpLine("↑/↓", "move", "enter", "select", "esc", "quit"))
+	b.WriteString(helpLine("↑/↓", "move", "enter", "select", "esc", "back"))
 
 	return b.String()
 }
@@ -896,11 +1048,10 @@ func (m rootModel) bannerTitle(a *Agent) (string, lipgloss.AdaptiveColor) {
 	}
 }
 
-// renderHubList draws the dashboard's always-focused list — the single entry
-// point into everything the TUI can do. The highlighted row renders as a
-// solid background bar (highlightRow); every other row keeps its normal
-// per-field coloring.
-func (m rootModel) renderHubList() string {
+// renderNewSessionList draws the New Session submenu's always-focused list.
+// The highlighted row renders as a solid background bar (highlightRow);
+// every other row keeps its normal per-field coloring.
+func (m rootModel) renderNewSessionList() string {
 	a := m.agent()
 	width := 60
 	if m.width > 0 {
@@ -908,7 +1059,7 @@ func (m rootModel) renderHubList() string {
 	}
 
 	var b strings.Builder
-	for i, it := range hubItems {
+	for i, it := range newSessionItems {
 		label := padRight(it.label, hubLabelWidth)
 		var detailPlain, detailStyled string
 
@@ -922,13 +1073,6 @@ func (m rootModel) renderHubList() string {
 			dir := truncate(m.dir, max(10, width-hubLabelWidth-26))
 			detailPlain = dir + "   " + m.projectStatusPlain()
 			detailStyled = styleAccent.Render(dir) + "   " + m.projectStatusStyled()
-
-		case rowCheckUpdates:
-			vw := max(10, width-hubLabelWidth-2)
-			if v := m.versionLinePlain(a, vw); v != "" {
-				detailPlain = v
-				detailStyled = m.renderVersionLine(a, vw)
-			}
 
 		case rowOllamaModel:
 			if m.cfg != nil {
@@ -944,6 +1088,78 @@ func (m rootModel) renderHubList() string {
 		}
 		b.WriteString("\n")
 	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderSessionsList draws the dashboard's top-level list: active sessions,
+// then "New session ▸", then dashGlobalItems, all under one flat cursor
+// (m.dashCursor) — the single entry point into everything the TUI can do.
+func (m rootModel) renderSessionsList() string {
+	width := 60
+	if m.width > 0 {
+		width = max(30, m.width-4)
+	}
+
+	var b strings.Builder
+	b.WriteString(styleCardTitleActive.Render("  Active sessions"))
+	b.WriteString("\n")
+
+	switch {
+	case !m.sessionsLoaded:
+		b.WriteString("  " + styleMuted.Render("checking…") + "\n")
+	case m.sessionsErr != nil:
+		b.WriteString("  " + styleErr.Render(m.sessionsErr.Error()) + "\n")
+	case len(m.sessions) == 0:
+		b.WriteString("  " + styleMuted.Render("none running") + "\n")
+	default:
+		for i, s := range m.sessions {
+			label := padRight(s.Agent.DisplayName, hubLabelWidth)
+			dir := truncate(s.Dir, max(10, width-hubLabelWidth-22))
+			since := formatRuntime(time.Since(s.Since)) + " ago"
+
+			plain := "  " + label + dir + "   " + since
+			styled := "  " + styleAccent.Render(label) + styleValue.Render(dir) + "   " + styleMuted.Render(since)
+
+			if i == m.dashCursor {
+				b.WriteString(highlightRow(width, plain))
+			} else {
+				b.WriteString(styled)
+			}
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\n")
+
+	newSessionRow := "  New session ▸"
+	if m.dashCursor == len(m.sessions) {
+		b.WriteString(highlightRow(width, newSessionRow))
+	} else {
+		b.WriteString(styleAccent.Render(newSessionRow))
+	}
+	b.WriteString("\n\n")
+
+	a := m.agent()
+	for i, it := range dashGlobalItems {
+		idx := len(m.sessions) + 1 + i
+		label := padRight(it.label, hubLabelWidth)
+		var detailPlain, detailStyled string
+
+		if it.row == rowCheckUpdates {
+			vw := max(10, width-hubLabelWidth-2)
+			if v := m.versionLinePlain(a, vw); v != "" {
+				detailPlain = v
+				detailStyled = m.renderVersionLine(a, vw)
+			}
+		}
+
+		if idx == m.dashCursor {
+			b.WriteString(highlightRow(width, "  "+label+detailPlain))
+		} else {
+			b.WriteString("  " + styleRow.Render(label) + detailStyled)
+		}
+		b.WriteString("\n")
+	}
+
 	return strings.TrimRight(b.String(), "\n")
 }
 

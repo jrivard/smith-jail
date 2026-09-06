@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -369,6 +370,86 @@ func FindRunningContainer(agent *Agent, dirHash string) string {
 	return strings.TrimPrefix(containers[0].Names[0], "/")
 }
 
+// activeSession is one running agent session, as the dashboard's sessions
+// overview (tui_model.go) shows it — deduped to one row per (agent,
+// directory) pair even if both a "run" and a "shell" container are up at
+// once, since netlog/netview key on agent+dir, not container identity.
+type activeSession struct {
+	Agent *Agent
+	Dir   string
+	Since time.Time
+}
+
+// ListActiveSessions returns every currently running agent session, most
+// recently started first.
+func ListActiveSessions() ([]activeSession, error) {
+	cli, err := dockerClient()
+	if err != nil {
+		return nil, err
+	}
+	defer cli.Close()
+
+	f := filters.NewArgs()
+	f.Add("name", "smithjail-")
+	f.Add("status", "running")
+	containers, err := cli.ContainerList(context.Background(), container.ListOptions{Filters: f})
+	if err != nil {
+		return nil, err
+	}
+
+	sessions := activeSessionsFromContainers(containers)
+	sortSessionsByRecency(sessions)
+	return sessions, nil
+}
+
+// sortSessionsByRecency orders sessions most-recently-started first.
+func sortSessionsByRecency(sessions []activeSession) {
+	sort.Slice(sessions, func(i, j int) bool { return sessions[i].Since.After(sessions[j].Since) })
+}
+
+// activeSessionsFromContainers is ListActiveSessions' filtering/dedup logic,
+// pulled out so it's testable without a Docker daemon: exclude the proxy
+// sidecar (labelled smithjail.role=proxy) and the Ollama sidecar (fixed
+// name, not a per-project session), resolve each remaining container's
+// agent/directory from its smithjail.agent/smithjail.project labels
+// (buildDockerRunArgs sets both on every run/shell/setup container), and
+// collapse duplicates to the earliest start time for that (agent, dir) pair.
+func activeSessionsFromContainers(containers []types.Container) []activeSession {
+	type key struct{ agent, dir string }
+	seen := make(map[key]activeSession)
+
+	for _, c := range containers {
+		if c.Labels["smithjail.role"] == "proxy" {
+			continue
+		}
+		if len(c.Names) > 0 && strings.TrimPrefix(c.Names[0], "/") == OllamaContainerName {
+			continue
+		}
+
+		agentName := c.Labels["smithjail.agent"]
+		dir := c.Labels["smithjail.project"]
+		if agentName == "" || dir == "" {
+			continue
+		}
+		agent := AgentByName(agentName)
+		if agent == nil {
+			continue
+		}
+
+		since := time.Unix(c.Created, 0)
+		k := key{agentName, dir}
+		if existing, ok := seen[k]; !ok || since.Before(existing.Since) {
+			seen[k] = activeSession{Agent: agent, Dir: dir, Since: since}
+		}
+	}
+
+	sessions := make([]activeSession, 0, len(seen))
+	for _, s := range seen {
+		sessions = append(sessions, s)
+	}
+	return sessions
+}
+
 // ListAllResources returns all containers and volumes for the given agent.
 // If agent is nil, returns resources for all agents.
 func ListAllResources(agent *Agent) (containers []types.Container, volumes []*volume.Volume) {
@@ -502,24 +583,31 @@ func selinuxEnforcing() bool {
 }
 
 // labelledMount joins a host path and a container path into a bind mount spec,
-// appending the SELinux label when one is in effect.
+// appending any extra mount options (e.g. "ro") together with the SELinux
+// label when one is in effect. Docker's -v syntax takes a single
+// comma-separated options field, so the two can't just be concatenated as
+// separate ":ro" and ":z" suffixes.
 //
 // Relabelling is recursive and destructive, so it is refused for paths where
 // that would be a bad idea — "/" or a whole home directory. In those cases the
-// mount is returned unlabelled with a warning rather than silently relabelling
-// thousands of unrelated files.
-func labelledMount(hostPath, containerPath, label string) string {
+// mount is returned with only the extra options (if any) and a warning,
+// rather than silently relabelling thousands of unrelated files.
+func labelledMount(hostPath, containerPath, label string, opts ...string) string {
 	spec := hostPath + ":" + containerPath
-	if label == "" {
+	allOpts := append([]string{}, opts...)
+	if label != "" {
+		if unsafeToRelabel(hostPath) {
+			printWarn(fmt.Sprintf(
+				"Refusing to SELinux-relabel %s (too broad); mounting unlabelled. "+
+					"Expect permission denials — mount a narrower directory.", hostPath))
+		} else {
+			allOpts = append(allOpts, strings.TrimPrefix(label, ":"))
+		}
+	}
+	if len(allOpts) == 0 {
 		return spec
 	}
-	if unsafeToRelabel(hostPath) {
-		printWarn(fmt.Sprintf(
-			"Refusing to SELinux-relabel %s (too broad); mounting unlabelled. "+
-				"Expect permission denials — mount a narrower directory.", hostPath))
-		return spec
-	}
-	return spec + label
+	return spec + ":" + strings.Join(allOpts, ",")
 }
 
 // unsafeToRelabel reports whether a recursive SELinux relabel of the given path

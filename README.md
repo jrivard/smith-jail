@@ -25,9 +25,11 @@ directory is mounted into the container. The agent cannot see — let alone touc
 anything else on the host, regardless of what it attempts.  [Debian Trixie Slim](https://hub.docker.com/layers/library/debian/trixie-slim/)
 is used as the docker base.
 
-The optional network jail goes further: when enabled, outbound connections from
-the container are restricted at the kernel level via nftables, allowing only the
-necessary AI APIs. 
+The optional network jail goes further: when enabled, the container's outbound
+traffic is transparently routed through a per-session proxy sidecar that only
+relays connections to the necessary AI APIs, by hostname and by IP — every
+other destination, and every other process in the container (not just the
+agent), is refused.
 
 The goal is a **reasonable, but not foolproof, sandbox**: a hard-ish boundary
 that keeps a misbehaving prompt, a jailbroken agent, or a malicious dependency
@@ -43,9 +45,10 @@ determined attacker who already has Docker access to your machine — see
 - **Filesystem jail** — only the target project directory is mounted into
   the container; the rest of the host filesystem, other projects, and host
   credentials (SSH keys, cloud config, browser profiles) stay invisible.
-- **Optional network jail** (Linux only) — kernel-level (nftables) outbound
-  allowlist restricting the container to the agent's own API plus any hosts
-  you add.
+- **Optional network jail** (Linux only) — a per-session proxy sidecar
+  transparently relays only allowed outbound connections (by hostname or IP),
+  restricting the container to the agent's own API plus any hosts you add —
+  with no standing capability grant on the smith-jail binary itself.
 - **Multi-agent support** —  each with its own image tag and
   credential directory so personas never collide.
 - **Per-project configuration** — base image, extra apt packages, resource
@@ -55,9 +58,9 @@ determined attacker who already has Docker access to your machine — see
 - **Interactive TUI dashboard** — run, shell, switch agent/project, edit
   settings, pick/pull an Ollama model, browse Docker artifacts, check for
   agent updates, and run `doctor`, all without memorizing flags.
-- **`doctor` checks** — verifies Docker, the `NET_ADMIN`/nftables toolchain,
-  SELinux status, config/build directory writability, disk space, and
-  credential-directory ownership before you hit a wall mid-session.
+- **`doctor` checks** — verifies Docker, SELinux status, config/build
+  directory writability, disk space, and credential-directory ownership
+  before you hit a wall mid-session.
 - **`setup` command** — runs an agent's own login flow inside the container,
   so credentials never have to be typed into a host-installed copy of the
   tool.
@@ -82,11 +85,16 @@ On `smith-jail [agent] run`:
 
 1. Reads config from `$XDG_CONFIG_HOME/smith-jail/smith-jail.env`
 2. Generates a Dockerfile and builds the image if not already current
-3. If `--network-jail` is set: creates a dedicated Docker bridge network,
-   resolves allowed hostnames to IPs, and writes scoped nftables rules
-4. Launches the container via `syscall.Exec` (replaces the process, inheriting
-   the TTY cleanly)
-5. On exit: tears down the nft table and Docker network (deferred cleanup)
+3. If `--network-jail` is set: creates a dedicated Docker network, starts a
+   proxy sidecar on it (building the sidecar's own image from source
+   smith-jail embeds, the first time it's needed), and runs a one-shot
+   helper — granted `NET_ADMIN` only for this single call — that installs
+   nft rules *inside the sidecar's network namespace* redirecting outbound
+   :80/:443/:53 traffic into it
+4. Launches the agent container, joined to the sidecar's namespace when the
+   jail is active
+5. On exit: removes the proxy sidecar and the session's Docker network
+   (deferred cleanup)
 
 Each project gets a container named by the SHA-256 hash of its absolute path,
 so two projects with the same directory name never collide.
@@ -95,15 +103,17 @@ so two projects with the same directory name never collide.
 smith-jail claude run /your/project
   │
   ├─ build image if needed (debian:bookworm-slim + tools + agent)
-  ├─ [optional] create smithjail-restricted Docker network
-  ├─ [optional] write nft rules scoped to bridge interface
+  ├─ [optional] create session Docker network
+  ├─ [optional] start proxy sidecar on it, wait for it to be listening
+  ├─ [optional] run netsetup helper (NET_ADMIN, one call, then exits) to
+  │             install nft redirect rules inside the sidecar's namespace
   │
   └─ docker run --rm
          ├─ bind mount: /your/project → /workspace              (rw)
          ├─ volume:     project-home  → /home/agent             (rw)
          ├─ bind mount: agent creds   → /home/agent/.claude etc (rw)
          ├─ Resource limits (8 GB RAM / 2 CPU default)
-         └─ network: bridge or smithjail-restricted
+         └─ network: bridge, or the proxy sidecar's namespace
 ```
 
 ---
@@ -112,7 +122,6 @@ smith-jail claude run /your/project
 
 - Linux (fully supported) or macOS (best-effort — see [Platform support](#platform-support))
 - Docker Engine on Linux; Docker Desktop on macOS
-- nftables (Linux `--network-jail` only)
 - Go 1.24+ (to build from source)
 
 ---
@@ -127,14 +136,13 @@ macOS builds (amd64/arm64) are published as **best effort**: they compile
 and the core filesystem jail works, but they don't get the same testing as
 Linux, and one feature is unavailable outright:
 
-- **`--network-jail` does not work on macOS.** It's implemented with
-  nftables and `CAP_NET_ADMIN`, both Linux kernel features. On macOS,
-  Docker Desktop runs containers inside a Linux VM that smith-jail doesn't
-  control, so there's no host-level firewall to program. Attempting
-  `--network-jail` (or enabling it in settings) on macOS fails fast with an
-  explanation rather than silently doing nothing; `doctor` reports the
-  related checks as not applicable instead of warning you to install
-  nftables.
+- **`--network-jail` does not work on macOS.** It's implemented with Linux
+  network namespaces and nftables, run inside the proxy sidecar and
+  netsetup helper containers. On macOS, Docker Desktop runs containers
+  inside a Linux VM that smith-jail doesn't control the namespacing of the
+  same way. Attempting `--network-jail` (or enabling it in settings) on
+  macOS fails fast with an explanation rather than silently doing nothing;
+  `doctor` reports the related check as not applicable.
 - SELinux labelling is a no-op on macOS (there's no SELinux to label for),
   which is harmless — it only affects bind-mount labels on SELinux hosts.
 
@@ -198,7 +206,24 @@ on screen; it hands off to the ordinary CLI code path once you've made a
 selection and the alternate screen has been torn down, so a jailed session
 still gets the real TTY.
 
-The dashboard is a single always-focused menu:
+The dashboard opens on a **sessions overview** — every currently running
+agent session (refreshed every few seconds), an entry into a **New session**
+submenu, and a handful of agent/project-independent utilities:
+
+| Row | Does |
+|---|---|
+| *(an active session)* | Open a live [`netview`](#network-jail) of that session's network activity |
+| New session ▸ | Enter the submenu below to configure/launch a session |
+| Docker artifacts | Browse/remove smith-jail's images, containers, volumes, and networks |
+| Check updates | Compare each agent's baked-in version against the latest available |
+| Doctor | Run the same environment checks as `smith-jail doctor` |
+| Help | Show the CLI help text |
+| Quit | Exit |
+
+`esc`/`q` on the sessions overview quits, same as the CLI. Selecting **New
+session** opens a second always-focused menu, scoped to whichever
+agent/project is currently selected; `esc`/`q` there steps back to the
+sessions overview instead:
 
 | Row | Does |
 |---|---|
@@ -208,12 +233,7 @@ The dashboard is a single always-focused menu:
 | Change project | Pick a directory, including recently-used projects |
 | Settings | Edit `smith-jail.env` settings (Global/Project scope via `tab`) |
 | Ollama model | Pick or pull the model `hermes-local` points at (see [Local models](#local-models-hermes-local)) |
-| Docker artifacts | Browse/remove smith-jail's images, containers, volumes, and networks |
 | Dockerfile | Preview the generated Dockerfile for the current agent/project without building it |
-| Check updates | Compare each agent's baked-in version against the latest available |
-| Doctor | Run the same environment checks as `smith-jail doctor` |
-| Help | Show the CLI help text |
-| Quit | Exit |
 
 Recently-used projects are tracked in `$XDG_CACHE_HOME/smith-jail/recent.json`,
 backed by the `smithjail.project` Docker label on every container/volume
@@ -272,6 +292,19 @@ first-time auth (e.g. a device-code/portal login flow).
 smith-jail hermes setup . --portal
 ```
 
+### netlog / netview
+
+Show a project's network jail activity — every DNS query and TCP connection
+the proxy sidecar saw, allowed or blocked — read from a persisted log that
+survives past the session itself. Since `run`/`shell` occupy smith-jail's
+own terminal for the whole session, run these in a second terminal or tmux
+pane to watch live. See [Network jail](#network-jail) for details.
+
+```bash
+smith-jail claude netview .                 # live TUI
+smith-jail claude netlog --follow .         # plain, pipeable tail
+```
+
 ### dockerfile
 
 Prints the Dockerfile that would be built for the given directory's effective
@@ -287,10 +320,10 @@ smith-jail claude dockerfile ~/projects/myapp
 ### doctor
 
 Checks the host environment for everything smith-jail depends on: Docker
-(binary, daemon, permissions), the optional `nftables`/`NET_ADMIN` toolchain
-for `--network-jail`, SELinux status, config/build directory writability,
-free disk space, and credential directory ownership. Prints a report and
-exits non-zero if anything failed. Also available from the TUI dashboard as
+(binary, daemon, permissions), whether `--network-jail` is usable on this
+platform, SELinux status, config/build directory writability, free disk
+space, and credential directory ownership. Prints a report and exits
+non-zero if anything failed. Also available from the TUI dashboard as
 "Doctor".
 
 ```bash
@@ -469,14 +502,46 @@ tag for that agent.
 ### Network jail
 
 The network jail restricts outbound connections from the container to the
-agent's API at the kernel level using nftables. This prevents project content
-from being exfiltrated over the network.
+agent's API and any hosts you allow, transparently — every process in the
+container is covered, not just the agent, and enforcement works by both
+hostname and IP so a hardcoded or cached address can't bypass it.
 
-Writing nft rules requires `NET_ADMIN`. Grant it to the binary once:
+It works by giving the session a dedicated proxy sidecar that owns the
+container's network namespace. A one-shot helper installs nft rules *inside
+that namespace* redirecting outbound :80/:443/:53 traffic into the sidecar,
+which forwards DNS queries to a real resolver (answering truthfully for
+allowed hosts, `NXDOMAIN` otherwise) and relays TCP connections after
+checking their real destination — recovered from the kernel via
+`SO_ORIGINAL_DST`, never by inspecting TLS or terminating it — against the
+same allow-list.
+
+No standing capability is required on the smith-jail binary or on the
+agent container: `NET_ADMIN` is granted only to the one-shot helper, for
+the single call that installs the rules, in a container smith-jail creates
+and removes itself. The sidecar and helper images are built locally the
+first time they're needed, from source smith-jail embeds — nothing is
+published or pulled from a registry.
+
+#### Watching network activity: netlog and netview
+
+The proxy sidecar logs every DNS query and TCP connection it sees — allowed
+or blocked, by hostname and IP — to a file under
+`$XDG_DATA_HOME/smith-jail/netlog/` (default `~/.local/share/...`), keyed by
+agent and project directory. Unlike the sidecar container itself, this file
+is never removed, so it holds every jailed session's history for that
+project, not just the current one.
+
+Because `run`/`shell` occupy smith-jail's own terminal for the whole
+session, watch it from a second terminal or tmux pane:
 
 ```bash
-sudo setcap cap_net_admin+ep $(which smith-jail)
+smith-jail claude netview .                         # live TUI: q quits, b toggles blocked-only
+smith-jail claude netlog --follow .                 # plain tail, pipeable/greppable
+smith-jail claude netlog --blocked-only .           # just what got refused
 ```
+
+`netlog`/`netview` read straight from disk — they work identically whether
+a session is currently running or long finished.
 
 ---
 
@@ -498,8 +563,10 @@ attacker who already has Docker or shell access to your machine.
   profiles, and so on — is never visible, regardless of what the agent
   attempts from inside.
 - **Network** (opt-in via `--network-jail`) — outbound connections are
-  dropped at the kernel level except to the agent's own API and any hosts
-  you explicitly allow.
+  transparently relayed through a per-session proxy sidecar that only
+  permits the agent's own API and any hosts you explicitly allow, by
+  hostname and by IP; everything else is refused, for every process in the
+  container.
 - **Projects from each other** — each project gets its own container name,
   image tag, and home volume, keyed by the SHA-256 hash of its absolute
   path, so one project's agent can't reach another's files or credentials.
@@ -515,10 +582,11 @@ attacker who already has Docker or shell access to your machine.
   function at all, and traffic to an allowed host can carry arbitrary data.
   The jail stops connections to *unexpected* destinations; it can't
   distinguish legitimate API traffic from data smuggled inside it.
-- **Allowed hosts are resolved to IPs once, at session start.** If an
-  allowed hostname sits behind shared hosting or a CDN, the nft rule permits
-  that whole IP — which may also serve other domains — and if the service
-  later moves to a different IP mid-session, the rule won't follow it.
+- **Only :80/:443/:53 are covered.** The jail redirects outbound HTTP,
+  HTTPS, and DNS; a service reachable solely on some other port (a raw TCP
+  API, git-over-ssh) isn't reachable through the jail at all, allowed or
+  not. Outbound UDP other than DNS (including HTTP/3-over-QUIC) is refused
+  outright rather than relayed.
 - **Each agent's own credentials are exposed to that agent.** The
   OAuth/config directory for whichever agent you're running
   (`~/.claude`, `~/.gemini`, `~/.hermes`, …) is bind-mounted read-write into
