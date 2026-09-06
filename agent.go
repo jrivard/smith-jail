@@ -34,6 +34,8 @@ var (
 		DefaultAllowed: []string{
 			"api.anthropic.com",
 			"claude.ai",
+			"platform.claude.com",
+			"downloads.claude.ai",
 			"statsig.anthropic.com",
 			"sentry.io",
 		},
