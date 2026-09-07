@@ -233,26 +233,44 @@ func homeVolumeName(agent *Agent, hash string) string {
 	return agent.ContainerPrefix() + "-home-" + hash
 }
 
-// EnsureHomeVolume creates the per-project home volume if it doesn't already exist.
-func EnsureHomeVolume(agent *Agent, cfg *Config, hash, dir string) error {
+// homeVolumeExists reports whether the given Docker volume already exists.
+func homeVolumeExists(name string) (bool, error) {
 	cli, err := dockerClient()
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer cli.Close()
 
-	name := homeVolumeName(agent, hash)
 	_, err = cli.VolumeInspect(context.Background(), name)
 	if err == nil {
-		return nil // already exists
+		return true, nil
 	}
-	if !client.IsErrNotFound(err) {
-		return fmt.Errorf("inspecting home volume: %w", err)
+	if client.IsErrNotFound(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("inspecting home volume: %w", err)
+}
+
+// EnsureHomeVolume creates the per-project home volume if it doesn't already exist.
+func EnsureHomeVolume(agent *Agent, cfg *Config, hash, dir string) error {
+	name := homeVolumeName(agent, hash)
+	exists, err := homeVolumeExists(name)
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
 	}
 
 	if !confirm(fmt.Sprintf("create Docker volume %q for project home directory", name), cfg.AutoApprove) {
 		return errAborted
 	}
+
+	cli, err := dockerClient()
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
 
 	_, err = cli.VolumeCreate(context.Background(), volume.CreateOptions{
 		Name: name,

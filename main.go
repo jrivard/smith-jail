@@ -492,6 +492,15 @@ func cmdRun(agent *Agent, rawDir string, opts *InvokeOptions, extraArgs []string
 		return
 	}
 
+	plan, err := buildRunPlan(agent, cfg, opts, dir, true)
+	if err != nil {
+		die("Building run plan: " + err.Error())
+	}
+	if !confirmRunPlan(plan) {
+		printInfo("Aborted.")
+		return
+	}
+
 	jail, cleanup, ok := prepareContainer(agent, cfg, opts, dir)
 	defer cleanup()
 	if !ok {
@@ -581,7 +590,12 @@ func cmdShell(agent *Agent, rawDir string, opts *InvokeOptions, extraArgs []stri
 
 	fmt.Println()
 	printWarn("No running container found for: " + dir)
-	if !confirm(fmt.Sprintf("start a fresh shell container for: %s", dir), cfg.AutoApprove) {
+
+	plan, err := buildRunPlan(agent, cfg, opts, dir, true)
+	if err != nil {
+		die("Building run plan: " + err.Error())
+	}
+	if !confirmRunPlan(plan) {
 		printInfo("Aborted.")
 		return
 	}
@@ -616,6 +630,15 @@ func cmdShell(agent *Agent, rawDir string, opts *InvokeOptions, extraArgs []stri
 // whatever host that flow calls out to.
 func cmdSetup(agent *Agent, rawDir string, opts *InvokeOptions, extraArgs []string) {
 	dir, cfg := resolveSession(agent, rawDir, opts)
+
+	plan, err := buildRunPlan(agent, cfg, opts, dir, false)
+	if err != nil {
+		die("Building run plan: " + err.Error())
+	}
+	if !confirmRunPlan(plan) {
+		printInfo("Aborted.")
+		return
+	}
 
 	jail, cleanup, ok := prepareContainer(agent, cfg, opts, dir)
 	defer cleanup()
@@ -1091,12 +1114,21 @@ func formatSize(bytes int64) string {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func confirm(action string, autoApprove bool) bool {
+	return confirmDefault(action, autoApprove, false)
+}
+
+// confirmDefault is confirm with a caller-chosen default for a bare Enter.
+func confirmDefault(action string, autoApprove bool, defaultYes bool) bool {
 	if autoApprove {
 		printInfo(action + " [auto-approved]")
 		return true
 	}
-	prompt := fmt.Sprintf("\n  %sConfirm:%s %s\n  Proceed? [y/N] ", colorBold, colorReset, action)
-	return readYesNo(prompt, false)
+	yn := "y/N"
+	if defaultYes {
+		yn = "Y/n"
+	}
+	prompt := fmt.Sprintf("\n  %sConfirm:%s %s\n  Proceed? [%s] ", colorBold, colorReset, action, yn)
+	return readYesNo(prompt, defaultYes)
 }
 
 // readYesNo prints prompt, reads a line from stdin, and reports whether it
