@@ -139,14 +139,21 @@ func LatestVersion(agent *Agent) string {
 
 // BuildImage builds the image for cfg's effective settings, tagged
 // content-addressed by agent.ImageRef(cfg).
-func BuildImage(agent *Agent, cfg *Config, noCache bool) error {
+//
+// refreshAgent forces a fresh fetch of the agent CLI (the curl/npm install
+// layer written by writeCacheBustArg) without a blanket --no-cache: that
+// used to also blow away the apt-get base-package layer, turning every
+// "update available" or `rebuild` into a full from-scratch rebuild of the
+// trixie base. Everything above that layer (FROM, apt-get) stays cached, so
+// only the CLI reinstall (and the cheap layers after it) actually reruns.
+func BuildImage(agent *Agent, cfg *Config, refreshAgent bool) error {
 	if err := cfg.WriteBuildContext(agent); err != nil {
 		return fmt.Errorf("preparing build context: %w", err)
 	}
 
 	args := []string{"build", "--progress", "plain"}
-	if noCache {
-		args = append(args, "--no-cache")
+	if refreshAgent {
+		args = append(args, "--build-arg", fmt.Sprintf("AGENT_CACHE_BUST=%d", time.Now().UnixNano()))
 	}
 	args = append(args,
 		"--build-arg", fmt.Sprintf("HOST_UID=%d", cfg.UID),

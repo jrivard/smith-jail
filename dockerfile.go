@@ -176,6 +176,18 @@ func (c *Config) writeLabels(b *strings.Builder, agent *Agent) {
 	b.WriteString(fmt.Sprintf("      smithjail.build-hash=%q\n", c.BuildHash(agent)))
 }
 
+// writeCacheBustArg declares the build arg that lets BuildImage force a
+// cache miss on the very next RUN instruction (the agent CLI fetch/install)
+// without invalidating the layers above it (base image, apt-get packages).
+// Those RUN commands' text never changes even when the upstream install
+// script or npm package does, so Docker would otherwise cache them forever;
+// referencing the arg's value inside that one RUN ties its cache key to
+// whatever BuildImage passes via --build-arg. A default build (no
+// --build-arg passed) always resolves to "0", so it stays cached.
+func (c *Config) writeCacheBustArg(b *strings.Builder) {
+	b.WriteString("ARG AGENT_CACHE_BUST=0\n")
+}
+
 // writeClaudeInstall writes the Claude Code install layer.
 func (c *Config) writeClaudeInstall(b *strings.Builder) {
 	basePkgs := "git curl ca-certificates ripgrep fd-find bash procps less vim-tiny"
@@ -190,7 +202,8 @@ func (c *Config) writeClaudeInstall(b *strings.Builder) {
 	b.WriteString("    && rm -rf /var/lib/apt/lists/*\n\n")
 
 	b.WriteString("ENV PATH=\"/usr/local/bin:/root/.local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin\"\n\n")
-	b.WriteString("RUN mkdir -p /root/.local/bin && \\\n")
+	c.writeCacheBustArg(b)
+	b.WriteString("RUN : \"${AGENT_CACHE_BUST}\" && mkdir -p /root/.local/bin && \\\n")
 	b.WriteString("    curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh && \\\n")
 	b.WriteString("    bash /tmp/claude-install.sh && \\\n")
 	b.WriteString("    rm /tmp/claude-install.sh && \\\n")
@@ -215,7 +228,8 @@ func (c *Config) writeGeminiInstall(b *strings.Builder) {
 	b.WriteString(sudoPkg)
 	b.WriteString(" \\\n    && rm -rf /var/lib/apt/lists/*\n\n")
 
-	b.WriteString("RUN npm install -g @google/gemini-cli\n\n")
+	c.writeCacheBustArg(b)
+	b.WriteString("RUN : \"${AGENT_CACHE_BUST}\" && npm install -g @google/gemini-cli\n\n")
 }
 
 // writeCodexInstall writes the Codex CLI install layer (requires Node.js).
@@ -235,7 +249,8 @@ func (c *Config) writeCodexInstall(b *strings.Builder) {
 	b.WriteString(sudoPkg)
 	b.WriteString(" \\\n    && rm -rf /var/lib/apt/lists/*\n\n")
 
-	b.WriteString("RUN npm install -g @openai/codex\n\n")
+	c.writeCacheBustArg(b)
+	b.WriteString("RUN : \"${AGENT_CACHE_BUST}\" && npm install -g @openai/codex\n\n")
 }
 
 // writeHermesInstall writes the Hermes Agent install layer.
@@ -254,7 +269,8 @@ func (c *Config) writeHermesInstall(b *strings.Builder) {
 	}
 	b.WriteString("    && rm -rf /var/lib/apt/lists/*\n\n")
 
-	b.WriteString("RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh -o /tmp/hermes-install.sh && \\\n")
+	c.writeCacheBustArg(b)
+	b.WriteString("RUN : \"${AGENT_CACHE_BUST}\" && curl -fsSL https://hermes-agent.nousresearch.com/install.sh -o /tmp/hermes-install.sh && \\\n")
 	b.WriteString("    bash /tmp/hermes-install.sh && \\\n")
 	b.WriteString("    rm /tmp/hermes-install.sh\n\n")
 }
