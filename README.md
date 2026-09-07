@@ -1,8 +1,10 @@
 # smith-jail
 
-A Go binary that runs AI coding agents inside a Docker container scoped to a single project directory. The host
-filesystem, credentials, and other projects are not visible to the container.
+An AI code agent runner that manages and executes agents inside a dynamically generated docker container scoped to a single project directory. The host
+filesystem, credentials, and other projects are not visible to the agent.   A network jail is also implemented to limit access to designated
+hosts only.
 
+AI Agent support:
 * [Claude Code](https://claude.ai/code),
 * [Gemini CLI](https://github.com/google/gemini-cli), 
 * [Codex CLI](https://github.com/openai/codex)
@@ -25,11 +27,11 @@ directory is mounted into the container. The agent cannot see — let alone touc
 anything else on the host, regardless of what it attempts.  [Debian Trixie Slim](https://hub.docker.com/layers/library/debian/trixie-slim/)
 is used as the docker base.
 
-The optional network jail goes further: when enabled, the container's outbound
+The network jail constrains the container's outbound
 traffic is transparently routed through a per-session proxy sidecar that only
 relays connections to the necessary AI APIs, by hostname and by IP — every
 other destination, and every other process in the container (not just the
-agent), is refused.
+agent), is refused.  An included viewer lets you monitor the traffic.
 
 The goal is a **reasonable, but not foolproof, sandbox**: a hard-ish boundary
 that keeps a misbehaving prompt, a jailbroken agent, or a malicious dependency
