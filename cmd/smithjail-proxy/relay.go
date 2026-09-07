@@ -19,9 +19,7 @@ import (
 	"io"
 	"net"
 	"sync"
-	"syscall"
 	"time"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -39,38 +37,15 @@ import (
 // non-redirected connection to this port has nothing to recover and
 // getsockopt fails, which callers should treat as "not a connection this
 // relay should be handling" rather than panic-worthy.
+//
+// SO_ORIGINAL_DST is a Linux netfilter-specific socket option with no
+// equivalent on other platforms — see relay_linux.go and relay_other.go.
+// This binary only ever runs inside a Linux container anyway (see
+// static-dockerfile/proxy/Dockerfile via proxyimages.go); the non-Linux
+// stub exists solely so the smith-jail module still builds and vets when
+// cross-compiled from other platforms.
 func getOriginalDst(conn *net.TCPConn) (*net.TCPAddr, error) {
-	sc, err := conn.SyscallConn()
-	if err != nil {
-		return nil, err
-	}
-
-	var raw unix.RawSockaddrInet4
-	size := uint32(unsafe.Sizeof(raw))
-	var sockErr error
-
-	ctrlErr := sc.Control(func(fd uintptr) {
-		_, _, errno := syscall.Syscall6(
-			syscall.SYS_GETSOCKOPT,
-			fd,
-			uintptr(unix.SOL_IP),
-			uintptr(unix.SO_ORIGINAL_DST),
-			uintptr(unsafe.Pointer(&raw)),
-			uintptr(unsafe.Pointer(&size)),
-			0,
-		)
-		if errno != 0 {
-			sockErr = errno
-		}
-	})
-	if ctrlErr != nil {
-		return nil, ctrlErr
-	}
-	if sockErr != nil {
-		return nil, sockErr
-	}
-
-	return parseOriginalDst(raw), nil
+	return getOriginalDstPlatform(conn)
 }
 
 // parseOriginalDst converts the raw sockaddr_in the kernel filled in into a
