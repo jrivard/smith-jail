@@ -62,7 +62,7 @@ func TestSetEnvValuesActivatesCommentedTemplateLine(t *testing.T) {
 	}
 
 	// Prose containing "=" must survive untouched.
-	if !strings.Contains(text, "sudo setcap cap_net_admin+ep $(which smith-jail)") {
+	if !strings.Contains(text, "JAIL_NETWORK_ALLOW_FILE=~/.config/smith-jail/allowed-hosts.txt") {
 		t.Error("prose comment was corrupted")
 	}
 }
@@ -246,7 +246,7 @@ func TestUnsetEnvValuesLeavesUnrelatedContentIntact(t *testing.T) {
 	if !strings.Contains(text, "# JAIL_CPU_LIMIT=2.0") {
 		t.Errorf("neighboring commented documentation should be left alone:\n%s", text)
 	}
-	if !strings.Contains(text, "sudo setcap cap_net_admin+ep $(which smith-jail)") {
+	if !strings.Contains(text, "JAIL_NETWORK_ALLOW_FILE=~/.config/smith-jail/allowed-hosts.txt") {
 		t.Error("prose comment was corrupted")
 	}
 }

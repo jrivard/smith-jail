@@ -144,7 +144,7 @@ func buildSettingFields(cfg *Config, scope settingsScope) []settingField {
 	add("JAIL_SUDO", "Passwordless sudo", fieldBool, boolValue(cfg.Sudo),
 		"let the agent user sudo — ignored when running as root", true)
 	add("JAIL_NETWORK_JAIL", "Network jail", fieldBool, boolValue(cfg.NetworkJailEnabled),
-		"restrict outbound traffic to the agent API (Linux only, needs CAP_NET_ADMIN)", false)
+		"restrict outbound traffic to the agent API (on by default on Linux, unsupported on macOS)", false)
 	add("JAIL_NETWORK_ALLOW", "Extra allowed hosts", fieldText, strings.Join(cfg.NetworkAllowHosts, " "),
 		"space-separated hosts permitted through the network jail", false)
 	add("JAIL_AUTO_APPROVE", "Auto-approve", fieldBool, boolValue(cfg.AutoApprove),

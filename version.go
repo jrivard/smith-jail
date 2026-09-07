@@ -19,7 +19,7 @@ import "fmt"
 // Version is smith-jail's release version. Overridden at build time via
 // -ldflags "-X main.Version=..." by the release workflow; defaults to this
 // value for plain `go build`.
-var Version = "0.1.0"
+var Version = "0.1.1"
 
 const copyrightLine = "Copyright 2026 Jason D. Rivard <code@jrivard.org>"
 

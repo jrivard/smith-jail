@@ -71,7 +71,8 @@ func newSessionID() (string, error) {
 
 // InvokeOptions holds per-invocation flags that affect network jail behaviour.
 type InvokeOptions struct {
-	NetworkJail     bool
+	NetworkJail     bool     // from --network-jail: force the jail on for this run
+	NoNetworkJail   bool     // from --no-network-jail: force the jail off for this run
 	ExtraAllowHosts []string // from --allow flag
 	AllowFile       string   // from --allow-file flag
 	AutoApprove     bool     // from --yes/-y flag

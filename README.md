@@ -45,10 +45,11 @@ determined attacker who already has Docker access to your machine — see
 - **Filesystem jail** — only the target project directory is mounted into
   the container; the rest of the host filesystem, other projects, and host
   credentials (SSH keys, cloud config, browser profiles) stay invisible.
-- **Optional network jail** (Linux only) — a per-session proxy sidecar
-  transparently relays only allowed outbound connections (by hostname or IP),
-  restricting the container to the agent's own API plus any hosts you add —
-  with no standing capability grant on the smith-jail binary itself.
+- **Network jail, on by default on Linux** (opt out with `--no-network-jail`)
+  — a per-session proxy sidecar transparently relays only allowed outbound
+  connections (by hostname or IP), restricting the container to the agent's
+  own API plus any hosts you add — with no standing capability grant on the
+  smith-jail binary itself.
 - **Multi-agent support** —  each with its own image tag and
   credential directory so personas never collide.
 - **Per-project configuration** — base image, extra apt packages, resource
@@ -85,7 +86,8 @@ On `smith-jail [agent] run`:
 
 1. Reads config from `$XDG_CONFIG_HOME/smith-jail/smith-jail.env`
 2. Generates a Dockerfile and builds the image if not already current
-3. If `--network-jail` is set: creates a dedicated Docker network, starts a
+3. If the network jail is active (on by default on Linux; `--no-network-jail`
+   disables it for this run): creates a dedicated Docker network, starts a
    proxy sidecar on it (building the sidecar's own image from source
    smith-jail embeds, the first time it's needed), and runs a one-shot
    helper — granted `NET_ADMIN` only for this single call — that installs
@@ -136,13 +138,14 @@ macOS builds (amd64/arm64) are published as **best effort**: they compile
 and the core filesystem jail works, but they don't get the same testing as
 Linux, and one feature is unavailable outright:
 
-- **`--network-jail` does not work on macOS.** It's implemented with Linux
-  network namespaces and nftables, run inside the proxy sidecar and
-  netsetup helper containers. On macOS, Docker Desktop runs containers
-  inside a Linux VM that smith-jail doesn't control the namespacing of the
-  same way. Attempting `--network-jail` (or enabling it in settings) on
-  macOS fails fast with an explanation rather than silently doing nothing;
-  `doctor` reports the related check as not applicable.
+- **The network jail does not work on macOS**, so it defaults to *off*
+  there (it defaults to *on* on Linux). It's implemented with Linux network
+  namespaces and nftables, run inside the proxy sidecar and netsetup helper
+  containers. On macOS, Docker Desktop runs containers inside a Linux VM
+  that smith-jail doesn't control the namespacing of the same way.
+  Explicitly forcing it on with `--network-jail` (or enabling it in
+  settings) on macOS fails fast with an explanation rather than silently
+  doing nothing; `doctor` reports the related check as not applicable.
 - SELinux labelling is a no-op on macOS (there's no SELinux to label for),
   which is harmless — it only affects bind-mount labels on SELinux hosts.
 
@@ -269,8 +272,9 @@ Launches the agent in the given directory. The directory is mounted at
 `/workspace` inside the container. All other host paths are invisible.
 
 ```bash
-smith-jail claude run --network-jail ~/projects/myapp
-smith-jail gemini run --network-jail --allow "github.com" ~/projects/myapp
+smith-jail claude run ~/projects/myapp                                     # network jail on by default (Linux)
+smith-jail gemini run --allow "github.com" ~/projects/myapp                # plus an extra allowed host
+smith-jail claude run --no-network-jail ~/projects/myapp                   # unrestricted network for this run
 ```
 
 ### shell
@@ -434,7 +438,8 @@ Both `run` and `shell` accept:
 
 | Flag | Description |
 |---|---|
-| `--network-jail` | Restrict outbound network to agent API only (Linux only) |
+| `--network-jail` | Restrict outbound network to agent API only (on by default on Linux) |
+| `--no-network-jail` | Disable the network jail for this run |
 | `--allow host1,host2` | Additional hosts to allow (comma or space separated) |
 | `--allow-file <path>` | File of additional hosts, one per line |
 | `--yes, -y` | Auto-approve all creation prompts |
@@ -562,21 +567,22 @@ attacker who already has Docker or shell access to your machine.
   host filesystem — other projects, SSH keys, cloud credentials, browser
   profiles, and so on — is never visible, regardless of what the agent
   attempts from inside.
-- **Network** (opt-in via `--network-jail`) — outbound connections are
-  transparently relayed through a per-session proxy sidecar that only
-  permits the agent's own API and any hosts you explicitly allow, by
-  hostname and by IP; everything else is refused, for every process in the
-  container.
+- **Network** (on by default on Linux; opt out with `--no-network-jail`) —
+  outbound connections are transparently relayed through a per-session
+  proxy sidecar that only permits the agent's own API and any hosts you
+  explicitly allow, by hostname and by IP; everything else is refused, for
+  every process in the container.
 - **Projects from each other** — each project gets its own container name,
   image tag, and home volume, keyed by the SHA-256 hash of its absolute
   path, so one project's agent can't reach another's files or credentials.
 
 ### Residual risks
 
-- **The network is open by default.** Without `--network-jail`, the
-  container has ordinary outbound internet access — nothing stops a
-  compromised agent from exfiltrating project contents. Pass
-  `--network-jail` for anything sensitive.
+- **The network is open on macOS, and anywhere the jail is turned off.**
+  With `--no-network-jail` (or on a platform where the jail defaults off),
+  the container has ordinary outbound internet access — nothing stops a
+  compromised agent from exfiltrating project contents. Leave the jail on
+  for anything sensitive.
 - **The allowed API endpoint is itself a channel.** Even with
   `--network-jail` on, the agent's own API has to stay reachable for it to
   function at all, and traffic to an allowed host can carry arbitrary data.

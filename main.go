@@ -72,7 +72,8 @@ session, e.g.:
   smith-jail claude netlog --follow --blocked-only .
 
 Flags (run, shell, and setup):
-  --network-jail          Restrict outbound network to the agent's API only (Linux only)
+  --network-jail          Restrict outbound network to the agent's API only (on by default on Linux)
+  --no-network-jail       Disable the network jail for this run
   --allow host1,host2     Additional hosts to allow (comma or space separated)
   --allow-file <path>     File of additional allowed hosts, one per line
   --yes, -y               Auto-approve all creation prompts
@@ -278,7 +279,8 @@ func reorderKnownFlags(fs *flag.FlagSet, args []string) []string {
 func parseCommonFlags(args []string, cmd string) (*InvokeOptions, []string) {
 	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 
-	networkJail := fs.Bool("network-jail", false, "Restrict outbound network to agent API only (Linux only)")
+	networkJail := fs.Bool("network-jail", false, "Restrict outbound network to agent API only (on by default on Linux)")
+	noNetworkJail := fs.Bool("no-network-jail", false, "Disable the network jail for this run")
 	allowHosts := fs.String("allow", "", "Comma/space-separated list of additional allowed hosts")
 	allowFile := fs.String("allow-file", "", "File of additional allowed hosts (one per line)")
 	yes := fs.Bool("yes", false, "Auto-approve all creation prompts")
@@ -294,9 +296,10 @@ func parseCommonFlags(args []string, cmd string) (*InvokeOptions, []string) {
 	_ = fs.Parse(reorderKnownFlags(fs, args))
 
 	opts := &InvokeOptions{
-		NetworkJail: *networkJail,
-		AllowFile:   *allowFile,
-		AutoApprove: *yes,
+		NetworkJail:   *networkJail,
+		NoNetworkJail: *noNetworkJail,
+		AllowFile:     *allowFile,
+		AutoApprove:   *yes,
 	}
 
 	if *allowHosts != "" {
@@ -349,8 +352,14 @@ func resolveSession(agent *Agent, rawDir string, opts *InvokeOptions) (dir strin
 	cfg = mustLoadConfig(dir, agent)
 	cfg.AutoApprove = cfg.AutoApprove || opts.AutoApprove
 
+	if opts.NetworkJail && opts.NoNetworkJail {
+		die("--network-jail and --no-network-jail are mutually exclusive")
+	}
 	if opts.NetworkJail {
 		cfg.NetworkJailEnabled = true
+	}
+	if opts.NoNetworkJail {
+		cfg.NetworkJailEnabled = false
 	}
 	if opts.AllowFile == "" && cfg.NetworkAllowFile != "" {
 		opts.AllowFile = cfg.NetworkAllowFile

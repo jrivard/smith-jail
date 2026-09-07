@@ -24,6 +24,7 @@ func TestParseRunFlags_OrderIndependent(t *testing.T) {
 		name        string
 		args        []string
 		wantJail    bool
+		wantNoJail  bool
 		wantDir     string
 		wantExtra   []string
 		wantAllowed []string
@@ -65,6 +66,12 @@ func TestParseRunFlags_OrderIndependent(t *testing.T) {
 			wantDir:   "/proj",
 			wantExtra: []string{"--", "--network-jail"},
 		},
+		{
+			name:       "no-network-jail flag after dir",
+			args:       []string{"/proj", "--no-network-jail"},
+			wantNoJail: true,
+			wantDir:    "/proj",
+		},
 	}
 
 	for _, tc := range cases {
@@ -72,6 +79,9 @@ func TestParseRunFlags_OrderIndependent(t *testing.T) {
 			opts, dir, extra := parseRunFlags(tc.args, "claude run")
 			if opts.NetworkJail != tc.wantJail {
 				t.Errorf("NetworkJail = %v, want %v", opts.NetworkJail, tc.wantJail)
+			}
+			if opts.NoNetworkJail != tc.wantNoJail {
+				t.Errorf("NoNetworkJail = %v, want %v", opts.NoNetworkJail, tc.wantNoJail)
 			}
 			if dir != tc.wantDir {
 				t.Errorf("dir = %q, want %q", dir, tc.wantDir)

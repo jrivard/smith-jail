@@ -221,7 +221,7 @@ func cmdNetLog(agent *Agent, rawDir string, follow, blockedOnly bool) {
 		die("Resolving network log path: " + err.Error())
 	}
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		printInfo("No network activity recorded yet for this project — run a session with --network-jail first.")
+		printInfo("No network activity recorded yet for this project — run a session with the network jail enabled first (it's on by default on Linux; see --no-network-jail).")
 		return
 	}
 

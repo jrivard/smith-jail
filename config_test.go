@@ -16,6 +16,7 @@ package main
 
 import (
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -106,6 +107,39 @@ func TestHermesLocalConfigDirIsIndependentOfHermes(t *testing.T) {
 	}
 	if cfg.HermesLocalConfig == "/tmp/moved-hermes" {
 		t.Error("HERMES_CONFIG_DIR leaked into HermesLocalConfig")
+	}
+}
+
+// The network jail defaults to on where it's actually supported (Linux) and
+// off elsewhere, so a fresh install is safe-by-default on Linux without
+// breaking macOS installs where enabling it fails fast (see NewNetworkJail).
+func TestNetworkJailDefaultsOnOnlyOnLinux(t *testing.T) {
+	setupIsolatedHome(t)
+	projectDir := t.TempDir()
+
+	cfg, err := LoadConfig(projectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := runtime.GOOS == "linux"
+	if cfg.NetworkJailEnabled != want {
+		t.Errorf("NetworkJailEnabled = %v, want %v on %s", cfg.NetworkJailEnabled, want, runtime.GOOS)
+	}
+}
+
+// JAIL_NETWORK_JAIL must still be able to override the platform default in
+// either direction.
+func TestNetworkJailEnvOverridesPlatformDefault(t *testing.T) {
+	setupIsolatedHome(t)
+	projectDir := t.TempDir()
+
+	t.Setenv("JAIL_NETWORK_JAIL", "false")
+	cfg, err := LoadConfig(projectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.NetworkJailEnabled {
+		t.Error("JAIL_NETWORK_JAIL=false did not disable the network jail")
 	}
 }
 

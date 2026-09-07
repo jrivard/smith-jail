@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -66,10 +67,10 @@ const envTemplateJail = `# =====================================================
 
 # ── Network jail ──────────────────────────────────────────────────────────────
 # When true, the container is restricted to only reach the agent's API.
-# All other outbound connections are dropped at the kernel level via nftables.
-# Requires NET_ADMIN capability:
-#   sudo setcap cap_net_admin+ep $(which smith-jail)
-# JAIL_NETWORK_JAIL=false
+# All other outbound connections are dropped at the kernel level via nftables,
+# applied inside an ephemeral helper container — no host setup required.
+# Defaults to true on Linux, false elsewhere (see --no-network-jail).
+# JAIL_NETWORK_JAIL=true
 
 # Space-separated list of additional hosts to allow through the network jail.
 # JAIL_NETWORK_ALLOW="github.com registry.npmjs.org"
@@ -355,6 +356,13 @@ func LoadConfig(dir string) (*Config, error) {
 		OllamaPort:          "11434",
 		OllamaContextLength: "65536",
 		OllamaModel:         "llama3.1:8b",
+		// The network jail is on by default on Linux, where it's fully
+		// supported and needs no host setup (see checkNetworkJailPlatform in
+		// doctor.go). It defaults off elsewhere — --network-jail (or
+		// JAIL_NETWORK_JAIL=true) still works there, it just fails fast with
+		// an explanation instead of silently doing nothing (see
+		// NewNetworkJail's GOOS check).
+		NetworkJailEnabled: runtime.GOOS == "linux",
 	}
 
 	cfg.EnvFile = filepath.Join(cfg.UserConfigDir, "smith-jail.env")
